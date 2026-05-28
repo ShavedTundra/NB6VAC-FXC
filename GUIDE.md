@@ -140,6 +140,64 @@ screen -dmS monitor python monitor.py
 
 Detach with `Ctrl+B, D` (tmux) or `Ctrl+A, D` (screen). Re-attach with `tmux attach -t monitor` or `screen -r monitor`.
 
+### Daemon Mode (macOS launchd)
+
+The project includes a launchd plist template for running the monitor as a macOS background service that auto-starts at login and auto-restarts on crash.
+
+> **Requirement**: Daemon mode uses `config.local.json` for the password (see §2, Method B). There is no `SFR_PASSWORD` environment variable in the plist — launchd does not inject shell env vars.
+
+#### Install
+
+1. Generate the personalized plist from the template (replace paths as needed):
+
+```bash
+sed -e "s|__PROJECT_DIR__|$(pwd)|g" \
+    -e "s|__PYTHON_PATH__|$(which python)|g" \
+    com.shavedtundra.sfr-monitor.plist.template \
+    > ~/Library/LaunchAgents/com.shavedtundra.sfr-monitor.plist
+```
+
+2. Make sure `config.local.json` exists in the project directory and `logs/` is writable.
+
+3. Load the service:
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.shavedtundra.sfr-monitor.plist
+```
+
+#### Uninstall
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.shavedtundra.sfr-monitor.plist
+```
+
+#### Check status
+
+```bash
+launchctl list | grep sfr-monitor
+```
+
+The second field is the PID if running, or the last exit code if stopped.
+
+#### Tail logs
+
+```bash
+# Monitor JSONL output (via stdout capture)
+tail -f logs/monitor_stdout.log
+
+# Check for errors
+tail -f logs/monitor_stderr.log
+
+# The monitor's own JSONL logs (recommended)
+tail -f logs/monitor_$(date -u +%Y-%m-%d).jsonl
+```
+
+#### Notes
+
+- `RunAtLoad=true` — starts automatically at login.
+- `KeepAlive=true` — launchd auto-restarts the monitor on crash (with built-in throttling for crash-loops).
+- The monitor handles `SIGTERM` cleanly (writes a shutdown entry to JSONL and exits) — `launchctl unload` triggers a graceful shutdown.
+
 ### What It Does — The 4 Modes
 
 The monitor operates as a state machine with four modes:
