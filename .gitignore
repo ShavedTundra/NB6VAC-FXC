@@ -134,3 +134,6 @@ dmypy.json
 # Project local config & logs
 config.local.json
 logs/
+
+# Sandcastle sandbox artifacts
+.sandcastle/
