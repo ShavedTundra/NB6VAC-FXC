@@ -26,8 +26,8 @@ Complete guide to set up, run, and draw conclusions from the SFR Box monitoring 
 Verify:
 
 ```bash
-python3 --version        # 3.12+
-python3 -c "import requests; import pick; print('OK')"
+python --version        # 3.12+
+python -c "import requests; import pick; print('OK')"
 ```
 
 You must be on the same local network as the box (default: `192.168.1.1`).
@@ -68,7 +68,7 @@ An **interactive** tool to explore the box's REST API by navigating menus. Usefu
 
 ```bash
 cd api-client/
-python3 client.py --hostname 192.168.1.1 --username admin --password admin
+python client.py --hostname 192.168.1.1 --username admin --password admin
 ```
 
 ### CLI Options
@@ -114,7 +114,7 @@ A **continuous daemon** that polls the box every 60 seconds, detects crashes and
 
 ```bash
 # Make sure password is configured (see §2)
-python3 monitor.py --hostname 192.168.1.1
+python monitor.py --hostname 192.168.1.1
 ```
 
 ### CLI Options
@@ -132,10 +132,10 @@ For long-term monitoring, run in a terminal multiplexer:
 
 ```bash
 # With tmux
-tmux new -s monitor "python3 monitor.py"
+tmux new -s monitor "python monitor.py"
 
 # With screen
-screen -dmS monitor python3 monitor.py
+screen -dmS monitor python monitor.py
 ```
 
 Detach with `Ctrl+B, D` (tmux) or `Ctrl+A, D` (screen). Re-attach with `tmux attach -t monitor` or `screen -r monitor`.
@@ -279,7 +279,7 @@ grep '"crash_detected": true' logs/*.jsonl
 grep '"box_unreachable": true' logs/*.jsonl | head -5
 
 # Extract uptime values over time
-cat logs/monitor_2026-05-28.jsonl | python3 -c "
+cat logs/monitor_2026-05-28.jsonl | python -c "
 import sys, json
 for line in sys.stdin:
     e = json.loads(line)
@@ -292,7 +292,7 @@ for line in sys.stdin:
 "
 
 # Extract DSL SNR over time
-cat logs/monitor_2026-05-28.jsonl | python3 -c "
+cat logs/monitor_2026-05-28.jsonl | python -c "
 import sys, json
 for line in sys.stdin:
     e = json.loads(line)
@@ -382,11 +382,11 @@ Conclusions:
 
 | Task | Command |
 |---|---|
-| Start monitor | `python3 monitor.py` |
-| Start monitor (background) | `tmux new -s monitor "python3 monitor.py"` |
+| Start monitor | `python monitor.py` |
+| Start monitor (background) | `tmux new -s monitor "python monitor.py"` |
 | Check monitor is running | `tmux attach -t monitor` (Ctrl+B, D to detach) |
 | View live log | `tail -f logs/monitor_$(date -u +%Y-%m-%d).jsonl` |
 | Count today's polls | `wc -l logs/monitor_$(date -u +%Y-%m-%d).jsonl` |
 | Find crashes | `grep '"crash_detected": true' logs/*.jsonl` |
 | Find outages | `grep '"box_unreachable": true' logs/*.jsonl` |
-| Launch API client | `cd api-client && python3 client.py` |
+| Launch API client | `cd api-client && python client.py` |
