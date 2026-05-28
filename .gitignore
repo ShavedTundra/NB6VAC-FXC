@@ -130,3 +130,7 @@ dmypy.json
 
 # PyCharm
 .idea
+
+# Project local config & logs
+config.local.json
+logs/
