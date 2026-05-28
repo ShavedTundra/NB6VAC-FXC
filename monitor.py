@@ -2,19 +2,17 @@
 """SFR Box monitor — continuous polling with crash detection, unreachable handling, and repeater tracking."""
 
 import argparse
-import hashlib
-import hmac
 import json
 import os
 import subprocess
 import sys
 import time
-from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from xml.etree import ElementTree
 
 import requests
+
+import sfr_box
 
 BASE_URL_TEMPLATE = "http://{hostname}/api/1.0/"
 
@@ -55,53 +53,6 @@ BASELINE_INTERVAL = 10
 REPEATER_MAC = "6C:4C:BC:91:DF:A9"
 
 
-def etree_to_dict(t: ElementTree.Element) -> dict:
-    d: dict = {t.tag: {} if t.attrib else None}
-    children = list(t)
-    if children:
-        dd: dict = defaultdict(list)
-        for dc in map(etree_to_dict, children):
-            for k, v in dc.items():
-                dd[k].append(v)
-        d = {t.tag: {k: v[0] if len(v) == 1 else v for k, v in dd.items()}}
-    if t.attrib:
-        d[t.tag].update(("@" + k, v) for k, v in t.attrib.items())
-    if t.text:
-        text = t.text.strip()
-        if children or t.attrib:
-            if text:
-                d[t.tag]["#text"] = text
-        else:
-            d[t.tag] = text
-    return d
-
-
-def parse_xml_response(content: bytes) -> dict:
-    return etree_to_dict(ElementTree.fromstring(content))
-
-
-def compute_auth_hash(token: str, username: str, password: str) -> str:
-    fh1 = hashlib.sha256(username.encode()).hexdigest()
-    key_hash1 = hmac.new(token.encode(), msg=fh1.encode(), digestmod=hashlib.sha256).hexdigest()
-    fh2 = hashlib.sha256(password.encode()).hexdigest()
-    key_hash2 = hmac.new(token.encode(), msg=fh2.encode(), digestmod=hashlib.sha256).hexdigest()
-    return key_hash1 + key_hash2
-
-
-def authenticate(base_url: str, username: str, password: str) -> tuple[str, bool]:
-    r = requests.get(f"{base_url}?method=auth.getToken", timeout=10)
-    data = parse_xml_response(r.content)
-    token = data["rsp"]["auth"]["@token"]
-
-    key_hash = compute_auth_hash(token, username, password)
-    r = requests.get(f"{base_url}?method=auth.checkToken&token={token}&hash={key_hash}", timeout=10)
-    data = parse_xml_response(r.content)
-
-    if data["rsp"]["@stat"] != "ok":
-        return token, False
-    return token, True
-
-
 def get_password() -> str:
     password = os.environ.get("SFR_PASSWORD")
     if password:
@@ -115,14 +66,6 @@ def get_password() -> str:
             return password
     print("ERROR: No password found. Set SFR_PASSWORD env var or create config.local.json", file=sys.stderr)
     sys.exit(1)
-
-
-def poll_endpoint(base_url: str, method: str, token: str | None = None) -> dict:
-    url = f"{base_url}?method={method}"
-    if token:
-        url += f"&token={token}"
-    r = requests.get(url, timeout=10)
-    return parse_xml_response(r.content)
 
 
 def write_jsonl(entry: dict) -> None:
@@ -222,7 +165,7 @@ def run_baseline(
         now = datetime.now(timezone.utc)
 
         try:
-            system_info = poll_endpoint(base_url, "system.getInfo")
+            system_info = sfr_box.poll_endpoint(base_url, "system.getInfo")
         except Exception as e:
             print(f"[BASELINE] Poll {i+1}/{BASELINE_POLLS} FAILED: {e}", file=sys.stderr)
             print(f"ERROR: Baseline failed — API unreachable or auth error. Exiting.", file=sys.stderr)
@@ -276,8 +219,8 @@ def run_crash_mode(
         now = datetime.now(timezone.utc)
 
         try:
-            system_info = poll_endpoint(base_url, "system.getInfo")
-            client_list = poll_endpoint(base_url, "wlan.getClientList", token)
+            system_info = sfr_box.poll_endpoint(base_url, "system.getInfo")
+            client_list = sfr_box.poll_endpoint(base_url, "wlan.getClientList", token)
         except Exception as e:
             entry = {
                 "timestamp": now.isoformat(),
@@ -372,7 +315,7 @@ def run_unreachable_mode(
 
             try:
                 r = requests.get(f"{base_url}?method=system.getInfo", timeout=10)
-                data = parse_xml_response(r.content)
+                data = sfr_box.parse_xml(r.content)
                 if data.get("rsp", {}).get("@stat") == "ok":
                     uptime_on_recovery = data["rsp"]["status"]["@uptime"]
                     print(f"\n[UNREACHABLE] Box is back online!")
@@ -400,7 +343,7 @@ def main() -> None:
     password = get_password()
     base_url = BASE_URL_TEMPLATE.format(hostname=args.hostname)
 
-    token, authenticated = authenticate(base_url, args.username, password)
+    token, authenticated = sfr_box.authenticate(base_url, args.username, password)
     if not authenticated:
         print("ERROR: Authentication failed — cannot start baseline", file=sys.stderr)
         sys.exit(1)
@@ -420,7 +363,7 @@ def main() -> None:
         auth_refreshed = False
 
         if time.monotonic() - last_auth_time >= AUTH_REFRESH_INTERVAL:
-            new_token, ok = authenticate(base_url, args.username, password)
+            new_token, ok = sfr_box.authenticate(base_url, args.username, password)
             if ok:
                 token = new_token
                 last_auth_time = time.monotonic()
@@ -436,16 +379,16 @@ def main() -> None:
         for endpoint in ALL_ENDPOINTS:
             needs_token = endpoint in PRIVATE_ENDPOINTS
             try:
-                results[endpoint] = poll_endpoint(base_url, endpoint, token if needs_token else None)
+                results[endpoint] = sfr_box.poll_endpoint(base_url, endpoint, token if needs_token else None)
                 resp_stat = results[endpoint].get("rsp", {}).get("@stat")
                 if resp_stat and resp_stat != "ok" and needs_token:
                     print(f"[AUTH] Auth failure on {endpoint}, re-authenticating...")
-                    new_token, ok = authenticate(base_url, args.username, password)
+                    new_token, ok = sfr_box.authenticate(base_url, args.username, password)
                     if ok:
                         token = new_token
                         last_auth_time = time.monotonic()
                         auth_refreshed = True
-                        results[endpoint] = poll_endpoint(base_url, endpoint, token)
+                        results[endpoint] = sfr_box.poll_endpoint(base_url, endpoint, token)
                     else:
                         print(f"[AUTH] Re-authentication failed")
             except requests.exceptions.ConnectionError as e:
@@ -478,7 +421,7 @@ def main() -> None:
                 except (ValueError, TypeError):
                     pass
 
-                new_token, ok = authenticate(base_url, args.username, password)
+                new_token, ok = sfr_box.authenticate(base_url, args.username, password)
                 if ok:
                     token = new_token
                     last_auth_time = time.monotonic()
