@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SFR Box monitor — continuous polling with crash detection and unreachable handling."""
+"""SFR Box monitor — continuous polling with crash detection, unreachable handling, and repeater tracking."""
 
 import argparse
 import hashlib
@@ -35,6 +35,8 @@ PRIVATE_ENDPOINTS = [
 
 ALL_ENDPOINTS = PUBLIC_ENDPOINTS + PRIVATE_ENDPOINTS
 
+CLIENT_LIST_ENDPOINTS = {"wlan.getClientList", "wlan5.getClientList", "lan.getHostsList"}
+
 AUTH_REFRESH_INTERVAL = 3600
 POLL_INTERVAL = 60
 
@@ -42,10 +44,15 @@ CRASH_POLL_INTERVAL = 10
 CRASH_MODE_MAX_DURATION = 300
 
 UNREACHABLE_PHASES = [
-    {"interval": 10, "duration": 120},    # Phase 1: 10s for 2 min
-    {"interval": 60, "duration": 600},    # Phase 2: 60s for 10 min
-    {"interval": 300, "duration": None},  # Phase 3: 5 min indefinitely
+    {"interval": 10, "duration": 120},
+    {"interval": 60, "duration": 600},
+    {"interval": 300, "duration": None},
 ]
+
+BASELINE_POLLS = 3
+BASELINE_INTERVAL = 10
+
+REPEATER_MAC = "6C:4C:BC:91:DF:A9"
 
 
 def etree_to_dict(t: ElementTree.Element) -> dict:
@@ -157,6 +164,92 @@ def extract_client_count(client_list: dict) -> int:
         return 0
 
 
+def tag_repeater_in_results(results: dict[str, dict]) -> None:
+    for endpoint in CLIENT_LIST_ENDPOINTS:
+        if endpoint not in results or "error" in results[endpoint]:
+            continue
+        try:
+            clients_data = results[endpoint]["rsp"]
+            if "clients" in clients_data:
+                client = clients_data["clients"]["client"]
+            elif "hosts" in clients_data:
+                client = clients_data["hosts"]["host"]
+            else:
+                continue
+            clients = client if isinstance(client, list) else [client]
+            for c in clients:
+                mac = c.get("@mac", c.get("@MAC", "")).upper()
+                if mac == REPEATER_MAC:
+                    c["repeater"] = True
+        except (KeyError, TypeError):
+            continue
+
+
+def find_repeater_status(results: dict[str, dict]) -> tuple[bool, str | None]:
+    last_seen: str | None = None
+    for endpoint in CLIENT_LIST_ENDPOINTS:
+        if endpoint not in results or "error" in results[endpoint]:
+            continue
+        try:
+            clients_data = results[endpoint]["rsp"]
+            if "clients" in clients_data:
+                client = clients_data["clients"]["client"]
+            elif "hosts" in clients_data:
+                client = clients_data["hosts"]["host"]
+            else:
+                continue
+            clients = client if isinstance(client, list) else [client]
+            for c in clients:
+                mac = c.get("@mac", c.get("@MAC", "")).upper()
+                if mac == REPEATER_MAC:
+                    ts = c.get("@last_seen", c.get("@assoc_time"))
+                    if ts is not None:
+                        last_seen = ts
+                    return True, last_seen
+        except (KeyError, TypeError):
+            continue
+    return False, None
+
+
+def run_baseline(
+    base_url: str,
+    token: str,
+    poll_count: int,
+) -> int:
+    print(f"[BASELINE] Starting {BASELINE_POLLS} baseline polls ({BASELINE_INTERVAL}s apart)...")
+    for i in range(BASELINE_POLLS):
+        poll_count += 1
+        now = datetime.now(timezone.utc)
+
+        try:
+            system_info = poll_endpoint(base_url, "system.getInfo")
+        except Exception as e:
+            print(f"[BASELINE] Poll {i+1}/{BASELINE_POLLS} FAILED: {e}", file=sys.stderr)
+            print(f"ERROR: Baseline failed — API unreachable or auth error. Exiting.", file=sys.stderr)
+            sys.exit(1)
+
+        resp_stat = system_info.get("rsp", {}).get("@stat")
+        if resp_stat != "ok":
+            print(f"[BASELINE] Poll {i+1}/{BASELINE_POLLS} FAILED: stat={resp_stat}", file=sys.stderr)
+            print(f"ERROR: Baseline failed — API returned error. Exiting.", file=sys.stderr)
+            sys.exit(1)
+
+        entry = {
+            "timestamp": now.isoformat(),
+            "poll_count": poll_count,
+            "baseline": True,
+            "system.getInfo": system_info,
+        }
+        write_jsonl(entry)
+        print(f"[BASELINE] Poll {i+1}/{BASELINE_POLLS} OK")
+
+        if i < BASELINE_POLLS - 1:
+            time.sleep(BASELINE_INTERVAL)
+
+    print(f"[BASELINE] All {BASELINE_POLLS} baseline polls succeeded — entering main loop")
+    return poll_count
+
+
 def run_crash_mode(
     base_url: str,
     token: str,
@@ -207,6 +300,13 @@ def run_crash_mode(
 
         recovered = uptime_climbing and clients_returning
 
+        crash_results: dict[str, dict] = {
+            "system.getInfo": system_info,
+            "wlan.getClientList": client_list,
+        }
+        tag_repeater_in_results(crash_results)
+        repeater_connected, repeater_last_seen = find_repeater_status(crash_results)
+
         entry = {
             "timestamp": now.isoformat(),
             "poll_count": poll_count,
@@ -215,8 +315,9 @@ def run_crash_mode(
             "pre_crash_uptime": pre_crash_uptime,
             "current_uptime": current_uptime,
             "current_clients": current_clients,
-            "system.getInfo": system_info,
-            "wlan.getClientList": client_list,
+            "repeater_connected": repeater_connected,
+            "repeater_last_seen": repeater_last_seen,
+            **crash_results,
         }
         write_jsonl(entry)
 
@@ -244,7 +345,6 @@ def run_unreachable_mode(
     print(f"{'='*60}\n")
     notify_macos("SFR Box", "Box unreachable — all API calls failing")
 
-    notified_recovery = False
     uptime_on_recovery: str | None = None
 
     for phase_idx, phase in enumerate(UNREACHABLE_PHASES):
@@ -263,6 +363,8 @@ def run_unreachable_mode(
                 "box_unreachable": True,
                 "phase": phase_num,
                 "error": error_message,
+                "repeater_connected": False,
+                "repeater_last_seen": None,
             }
             write_jsonl(entry)
 
@@ -300,11 +402,14 @@ def main() -> None:
 
     token, authenticated = authenticate(base_url, args.username, password)
     if not authenticated:
-        print("ERROR: Authentication failed", file=sys.stderr)
+        print("ERROR: Authentication failed — cannot start baseline", file=sys.stderr)
         sys.exit(1)
 
     print("[AUTH] OK — initial token obtained")
+
     poll_count = 0
+    poll_count = run_baseline(base_url, token, poll_count)
+
     last_auth_time = time.monotonic()
     previous_uptime: int | None = None
     pre_crash_client_count = 0
@@ -380,6 +485,9 @@ def main() -> None:
 
             continue
 
+        tag_repeater_in_results(results)
+        repeater_connected, repeater_last_seen = find_repeater_status(results)
+
         current_uptime = extract_uptime(results.get("system.getInfo", {}))
 
         crash_detected = False
@@ -405,12 +513,15 @@ def main() -> None:
             "poll_count": poll_count,
             "status": status,
             "auth_refreshed": auth_refreshed,
+            "repeater_connected": repeater_connected,
+            "repeater_last_seen": repeater_last_seen,
             **results,
         }
         write_jsonl(entry)
 
         flag = " [AUTH REFRESHED]" if auth_refreshed else ""
-        print(f"[{now.strftime('%H:%M:%S')}] Poll #{poll_count} — {status}{flag}")
+        rep_flag = " [REPEATER UP]" if repeater_connected else " [REPEATER DOWN]"
+        print(f"[{now.strftime('%H:%M:%S')}] Poll #{poll_count} — {status}{flag}{rep_flag}")
 
         if crash_detected:
             poll_count = run_crash_mode(
