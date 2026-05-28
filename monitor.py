@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,43 +15,43 @@ import requests
 
 import sfr_box
 
-BASE_URL_TEMPLATE = "http://{hostname}/api/1.0/"
-
-PUBLIC_ENDPOINTS = [
-    "system.getInfo",
-    "wan.getInfo",
-    "ppp.getInfo",
-    "dsl.getInfo",
-    "ftth.getInfo",
-    "ont.getInfo",
-    "lan.getHostsList",
+ALL_ENDPOINTS = [
+    "system.getInfo", "wan.getInfo", "ppp.getInfo", "dsl.getInfo",
+    "ftth.getInfo", "ont.getInfo", "lan.getHostsList",
+    "wlan.getClientList", "wlan5.getClientList",
 ]
-
-PRIVATE_ENDPOINTS = [
-    "wlan.getClientList",
-    "wlan5.getClientList",
-]
-
-ALL_ENDPOINTS = PUBLIC_ENDPOINTS + PRIVATE_ENDPOINTS
 
 CLIENT_LIST_ENDPOINTS = {"wlan.getClientList", "wlan5.getClientList", "lan.getHostsList"}
 
-AUTH_REFRESH_INTERVAL = 3600
-POLL_INTERVAL = 60
 
-CRASH_POLL_INTERVAL = 10
-CRASH_MODE_MAX_DURATION = 300
+@dataclass
+class MonitorConfig:
+    hostname: str
+    username: str
+    password: str
+    poll_interval: int = 60
+    crash_poll_interval: int = 10
+    crash_mode_max_duration: int = 300
+    baseline_polls: int = 3
+    baseline_interval: int = 10
+    auth_refresh_interval: int = 3600
+    repeater_mac: str = "6C:4C:BC:91:DF:A9"
+    public_endpoints: list[str] = field(default_factory=lambda: [
+        "system.getInfo", "wan.getInfo", "ppp.getInfo", "dsl.getInfo",
+        "ftth.getInfo", "ont.getInfo", "lan.getHostsList",
+    ])
+    private_endpoints: list[str] = field(default_factory=lambda: [
+        "wlan.getClientList", "wlan5.getClientList",
+    ])
+    unreachable_phases: list[dict] = field(default_factory=lambda: [
+        {"interval": 10, "duration": 120},
+        {"interval": 60, "duration": 600},
+        {"interval": 300, "duration": None},
+    ])
 
-UNREACHABLE_PHASES = [
-    {"interval": 10, "duration": 120},
-    {"interval": 60, "duration": 600},
-    {"interval": 300, "duration": None},
-]
-
-BASELINE_POLLS = 3
-BASELINE_INTERVAL = 10
-
-REPEATER_MAC = "6C:4C:BC:91:DF:A9"
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.hostname}/api/1.0/"
 
 
 def get_password() -> str:
@@ -107,7 +108,7 @@ def extract_client_count(client_list: dict) -> int:
         return 0
 
 
-def tag_repeater_in_results(results: dict[str, dict]) -> None:
+def tag_repeater_in_results(results: dict[str, dict], repeater_mac: str) -> None:
     for endpoint in CLIENT_LIST_ENDPOINTS:
         if endpoint not in results or "error" in results[endpoint]:
             continue
@@ -122,13 +123,13 @@ def tag_repeater_in_results(results: dict[str, dict]) -> None:
             clients = client if isinstance(client, list) else [client]
             for c in clients:
                 mac = c.get("@mac", c.get("@MAC", "")).upper()
-                if mac == REPEATER_MAC:
+                if mac == repeater_mac:
                     c["repeater"] = True
         except (KeyError, TypeError):
             continue
 
 
-def find_repeater_status(results: dict[str, dict]) -> tuple[bool, str | None]:
+def find_repeater_status(results: dict[str, dict], repeater_mac: str) -> tuple[bool, str | None]:
     last_seen: str | None = None
     for endpoint in CLIENT_LIST_ENDPOINTS:
         if endpoint not in results or "error" in results[endpoint]:
@@ -144,7 +145,7 @@ def find_repeater_status(results: dict[str, dict]) -> tuple[bool, str | None]:
             clients = client if isinstance(client, list) else [client]
             for c in clients:
                 mac = c.get("@mac", c.get("@MAC", "")).upper()
-                if mac == REPEATER_MAC:
+                if mac == repeater_mac:
                     ts = c.get("@last_seen", c.get("@assoc_time"))
                     if ts is not None:
                         last_seen = ts
@@ -155,25 +156,25 @@ def find_repeater_status(results: dict[str, dict]) -> tuple[bool, str | None]:
 
 
 def run_baseline(
-    base_url: str,
+    config: MonitorConfig,
     token: str,
     poll_count: int,
 ) -> int:
-    print(f"[BASELINE] Starting {BASELINE_POLLS} baseline polls ({BASELINE_INTERVAL}s apart)...")
-    for i in range(BASELINE_POLLS):
+    print(f"[BASELINE] Starting {config.baseline_polls} baseline polls ({config.baseline_interval}s apart)...")
+    for i in range(config.baseline_polls):
         poll_count += 1
         now = datetime.now(timezone.utc)
 
         try:
-            system_info = sfr_box.poll_endpoint(base_url, "system.getInfo")
+            system_info = sfr_box.poll_endpoint(config.base_url, "system.getInfo")
         except Exception as e:
-            print(f"[BASELINE] Poll {i+1}/{BASELINE_POLLS} FAILED: {e}", file=sys.stderr)
+            print(f"[BASELINE] Poll {i+1}/{config.baseline_polls} FAILED: {e}", file=sys.stderr)
             print(f"ERROR: Baseline failed — API unreachable or auth error. Exiting.", file=sys.stderr)
             sys.exit(1)
 
         resp_stat = system_info.get("rsp", {}).get("@stat")
         if resp_stat != "ok":
-            print(f"[BASELINE] Poll {i+1}/{BASELINE_POLLS} FAILED: stat={resp_stat}", file=sys.stderr)
+            print(f"[BASELINE] Poll {i+1}/{config.baseline_polls} FAILED: stat={resp_stat}", file=sys.stderr)
             print(f"ERROR: Baseline failed — API returned error. Exiting.", file=sys.stderr)
             sys.exit(1)
 
@@ -184,43 +185,41 @@ def run_baseline(
             "system.getInfo": system_info,
         }
         write_jsonl(entry)
-        print(f"[BASELINE] Poll {i+1}/{BASELINE_POLLS} OK")
+        print(f"[BASELINE] Poll {i+1}/{config.baseline_polls} OK")
 
-        if i < BASELINE_POLLS - 1:
-            time.sleep(BASELINE_INTERVAL)
+        if i < config.baseline_polls - 1:
+            time.sleep(config.baseline_interval)
 
-    print(f"[BASELINE] All {BASELINE_POLLS} baseline polls succeeded — entering main loop")
+    print(f"[BASELINE] All {config.baseline_polls} baseline polls succeeded — entering main loop")
     return poll_count
 
 
 def run_crash_mode(
-    base_url: str,
+    config: MonitorConfig,
     token: str,
-    username: str,
-    password: str,
     pre_crash_uptime: int,
     pre_crash_client_count: int,
     poll_count: int,
 ) -> int:
     print(f"\n{'='*60}")
     print(f"  *** CRASH DETECTED ***  Uptime reset from {pre_crash_uptime}s")
-    print(f"  Entering rapid polling mode (10s interval, max 5 min)")
+    print(f"  Entering rapid polling mode ({config.crash_poll_interval}s interval, max {config.crash_mode_max_duration}s)")
     print(f"{'='*60}\n")
     notify_macos("SFR Box", "Crash detected — uptime reset")
 
     crash_start = time.monotonic()
     while True:
         elapsed = time.monotonic() - crash_start
-        if elapsed >= CRASH_MODE_MAX_DURATION:
-            print(f"[CRASH MODE] 5-minute cap reached, returning to normal polling")
+        if elapsed >= config.crash_mode_max_duration:
+            print(f"[CRASH MODE] {config.crash_mode_max_duration}s cap reached, returning to normal polling")
             break
 
         poll_count += 1
         now = datetime.now(timezone.utc)
 
         try:
-            system_info = sfr_box.poll_endpoint(base_url, "system.getInfo")
-            client_list = sfr_box.poll_endpoint(base_url, "wlan.getClientList", token)
+            system_info = sfr_box.poll_endpoint(config.base_url, "system.getInfo")
+            client_list = sfr_box.poll_endpoint(config.base_url, "wlan.getClientList", token)
         except Exception as e:
             entry = {
                 "timestamp": now.isoformat(),
@@ -232,7 +231,7 @@ def run_crash_mode(
             }
             write_jsonl(entry)
             print(f"[CRASH MODE #{poll_count}] Error: {e}")
-            time.sleep(CRASH_POLL_INTERVAL)
+            time.sleep(config.crash_poll_interval)
             continue
 
         current_uptime = extract_uptime(system_info)
@@ -247,8 +246,8 @@ def run_crash_mode(
             "system.getInfo": system_info,
             "wlan.getClientList": client_list,
         }
-        tag_repeater_in_results(crash_results)
-        repeater_connected, repeater_last_seen = find_repeater_status(crash_results)
+        tag_repeater_in_results(crash_results, config.repeater_mac)
+        repeater_connected, repeater_last_seen = find_repeater_status(crash_results, config.repeater_mac)
 
         entry = {
             "timestamp": now.isoformat(),
@@ -272,13 +271,13 @@ def run_crash_mode(
             notify_macos("SFR Box", f"Recovered — uptime climbing, {current_clients} clients back")
             break
 
-        time.sleep(CRASH_POLL_INTERVAL)
+        time.sleep(config.crash_poll_interval)
 
     return poll_count
 
 
 def run_unreachable_mode(
-    base_url: str,
+    config: MonitorConfig,
     error_message: str,
     poll_count: int,
 ) -> tuple[int, bool, str | None]:
@@ -290,7 +289,7 @@ def run_unreachable_mode(
 
     uptime_on_recovery: str | None = None
 
-    for phase_idx, phase in enumerate(UNREACHABLE_PHASES):
+    for phase_idx, phase in enumerate(config.unreachable_phases):
         phase_num = phase_idx + 1
         phase_start = time.monotonic()
         phase_interval = phase["interval"]
@@ -314,7 +313,7 @@ def run_unreachable_mode(
             print(f"[UNREACHABLE phase={phase_num} #{poll_count}] {error_message}")
 
             try:
-                r = requests.get(f"{base_url}?method=system.getInfo", timeout=10)
+                r = requests.get(f"{config.base_url}?method=system.getInfo", timeout=10)
                 data = sfr_box.parse_xml(r.content)
                 if data.get("rsp", {}).get("@stat") == "ok":
                     uptime_on_recovery = data["rsp"]["status"]["@uptime"]
@@ -341,9 +340,9 @@ def main() -> None:
     args = parser.parse_args()
 
     password = get_password()
-    base_url = BASE_URL_TEMPLATE.format(hostname=args.hostname)
+    config = MonitorConfig(hostname=args.hostname, username=args.username, password=password)
 
-    token, authenticated = sfr_box.authenticate(base_url, args.username, password)
+    token, authenticated = sfr_box.authenticate(config.base_url, config.username, config.password)
     if not authenticated:
         print("ERROR: Authentication failed — cannot start baseline", file=sys.stderr)
         sys.exit(1)
@@ -351,7 +350,7 @@ def main() -> None:
     print("[AUTH] OK — initial token obtained")
 
     poll_count = 0
-    poll_count = run_baseline(base_url, token, poll_count)
+    poll_count = run_baseline(config, token, poll_count)
 
     last_auth_time = time.monotonic()
     previous_uptime: int | None = None
@@ -362,8 +361,8 @@ def main() -> None:
         now = datetime.now(timezone.utc)
         auth_refreshed = False
 
-        if time.monotonic() - last_auth_time >= AUTH_REFRESH_INTERVAL:
-            new_token, ok = sfr_box.authenticate(base_url, args.username, password)
+        if time.monotonic() - last_auth_time >= config.auth_refresh_interval:
+            new_token, ok = sfr_box.authenticate(config.base_url, config.username, config.password)
             if ok:
                 token = new_token
                 last_auth_time = time.monotonic()
@@ -377,18 +376,18 @@ def main() -> None:
         last_error = ""
 
         for endpoint in ALL_ENDPOINTS:
-            needs_token = endpoint in PRIVATE_ENDPOINTS
+            needs_token = endpoint in config.private_endpoints
             try:
-                results[endpoint] = sfr_box.poll_endpoint(base_url, endpoint, token if needs_token else None)
+                results[endpoint] = sfr_box.poll_endpoint(config.base_url, endpoint, token if needs_token else None)
                 resp_stat = results[endpoint].get("rsp", {}).get("@stat")
                 if resp_stat and resp_stat != "ok" and needs_token:
                     print(f"[AUTH] Auth failure on {endpoint}, re-authenticating...")
-                    new_token, ok = sfr_box.authenticate(base_url, args.username, password)
+                    new_token, ok = sfr_box.authenticate(config.base_url, config.username, config.password)
                     if ok:
                         token = new_token
                         last_auth_time = time.monotonic()
                         auth_refreshed = True
-                        results[endpoint] = sfr_box.poll_endpoint(base_url, endpoint, token)
+                        results[endpoint] = sfr_box.poll_endpoint(config.base_url, endpoint, token)
                     else:
                         print(f"[AUTH] Re-authentication failed")
             except requests.exceptions.ConnectionError as e:
@@ -406,7 +405,7 @@ def main() -> None:
 
         if failures == len(ALL_ENDPOINTS):
             poll_count, recovered, uptime_str = run_unreachable_mode(
-                base_url, last_error, poll_count,
+                config, last_error, poll_count,
             )
             if recovered and uptime_str is not None:
                 try:
@@ -414,22 +413,22 @@ def main() -> None:
                     if previous_uptime is not None and recovered_uptime < previous_uptime:
                         print(f"[RECOVERY] Uptime reset detected ({recovered_uptime}s < {previous_uptime}s), triggering crash mode")
                         poll_count = run_crash_mode(
-                            base_url, token, args.username, password,
+                            config, token,
                             previous_uptime, pre_crash_client_count, poll_count,
                         )
                     previous_uptime = recovered_uptime
                 except (ValueError, TypeError):
                     pass
 
-                new_token, ok = sfr_box.authenticate(base_url, args.username, password)
+                new_token, ok = sfr_box.authenticate(config.base_url, config.username, config.password)
                 if ok:
                     token = new_token
                     last_auth_time = time.monotonic()
 
             continue
 
-        tag_repeater_in_results(results)
-        repeater_connected, repeater_last_seen = find_repeater_status(results)
+        tag_repeater_in_results(results, config.repeater_mac)
+        repeater_connected, repeater_last_seen = find_repeater_status(results, config.repeater_mac)
 
         current_uptime = extract_uptime(results.get("system.getInfo", {}))
 
@@ -468,12 +467,12 @@ def main() -> None:
 
         if crash_detected:
             poll_count = run_crash_mode(
-                base_url, token, args.username, password,
+                config, token,
                 previous_uptime or 0, pre_crash_client_count, poll_count,
             )
             previous_uptime = None
 
-        time.sleep(POLL_INTERVAL)
+        time.sleep(config.poll_interval)
 
 
 if __name__ == "__main__":
