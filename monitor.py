@@ -4,8 +4,10 @@
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -589,14 +591,29 @@ def main() -> None:
     )
     print(f"[BASELINE] Starting {config.baseline_polls} baseline polls ({config.baseline_interval}s apart)...")
 
-    while True:
+    shutdown_event = threading.Event()
+
+    def handle_signal(signum: int, _frame: object) -> None:
+        shutdown_event.set()
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    while not shutdown_event.is_set():
         prev_mode = state.mode
         now_utc = datetime.now(timezone.utc)
         now_mono = time.monotonic()
         state, entry = tick(state, config, now_utc, now_mono)
         write_jsonl(entry)
         on_transition(prev_mode, state.mode, state)
-        time.sleep(get_sleep_interval(state, config))
+        shutdown_event.wait(timeout=get_sleep_interval(state, config))
+
+    write_jsonl({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "poll_count": state.poll_count,
+        "status": "shutdown",
+    })
+    print(f"[SHUTDOWN] Clean exit after {state.poll_count} polls")
 
 
 if __name__ == "__main__":
