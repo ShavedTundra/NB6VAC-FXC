@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SFR Box monitor — authenticates, polls system.getInfo, writes JSONL log."""
+"""SFR Box monitor — continuous polling of 9 endpoints with JSONL logging."""
 
 import argparse
 import hashlib
@@ -7,15 +7,35 @@ import hmac
 import json
 import os
 import sys
+import time
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from xml.etree import ElementTree
 
 import requests
-from collections import defaultdict
-
 
 BASE_URL_TEMPLATE = "http://{hostname}/api/1.0/"
+
+PUBLIC_ENDPOINTS = [
+    "system.getInfo",
+    "wan.getInfo",
+    "ppp.getInfo",
+    "dsl.getInfo",
+    "ftth.getInfo",
+    "ont.getInfo",
+    "lan.getHostsList",
+]
+
+PRIVATE_ENDPOINTS = [
+    "wlan.getClientList",
+    "wlan5.getClientList",
+]
+
+ALL_ENDPOINTS = PUBLIC_ENDPOINTS + PRIVATE_ENDPOINTS
+
+AUTH_REFRESH_INTERVAL = 3600  # 60 minutes
+POLL_INTERVAL = 60  # seconds
 
 
 def etree_to_dict(t: ElementTree.Element) -> dict:
@@ -97,8 +117,29 @@ def write_jsonl(entry: dict) -> None:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+def poll_cycle(base_url: str, token: str) -> dict:
+    results: dict[str, dict] = {}
+    failures = 0
+    auth_refreshed = False
+
+    for endpoint in ALL_ENDPOINTS:
+        try:
+            results[endpoint] = poll_endpoint(base_url, endpoint, token if endpoint in PRIVATE_ENDPOINTS else None)
+        except Exception as e:
+            results[endpoint] = {"error": str(e)}
+            failures += 1
+
+    status = "OK"
+    if failures == len(ALL_ENDPOINTS):
+        status = "ALL FAILED"
+    elif failures > 0:
+        status = f"PARTIAL ({failures} failures)"
+
+    return {"results": results, "status": status, "auth_refreshed": auth_refreshed}
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="SFR Box monitor")
+    parser = argparse.ArgumentParser(description="SFR Box continuous monitor")
     parser.add_argument("--hostname", default="192.168.1.1", help="Box hostname or IP (default: 192.168.1.1)")
     parser.add_argument("--username", default="admin", help="Username for auth (default: admin)")
     args = parser.parse_args()
@@ -111,18 +152,67 @@ def main() -> None:
         print("ERROR: Authentication failed", file=sys.stderr)
         sys.exit(1)
 
-    print(f"[AUTH] OK — token obtained")
+    print("[AUTH] OK — initial token obtained")
+    poll_count = 0
+    last_auth_time = time.monotonic()
 
-    result = poll_endpoint(base_url, "system.getInfo")
+    while True:
+        poll_count += 1
+        now = datetime.now(timezone.utc)
+        auth_refreshed = False
 
-    entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "system.getInfo": result,
-    }
-    write_jsonl(entry)
+        if time.monotonic() - last_auth_time >= AUTH_REFRESH_INTERVAL:
+            new_token, ok = authenticate(base_url, args.username, password)
+            if ok:
+                token = new_token
+                last_auth_time = time.monotonic()
+                auth_refreshed = True
+                print(f"[AUTH] Token refreshed proactively")
+            else:
+                print(f"[AUTH] WARNING: proactive refresh failed, keeping old token")
 
-    print(f"[POLL] system.getInfo — {json.dumps(result, indent=2)}")
-    print(f"[LOG] Written to logs/")
+        results: dict[str, dict] = {}
+        failures = 0
+
+        for endpoint in ALL_ENDPOINTS:
+            needs_token = endpoint in PRIVATE_ENDPOINTS
+            try:
+                results[endpoint] = poll_endpoint(base_url, endpoint, token if needs_token else None)
+                resp_stat = results[endpoint].get("rsp", {}).get("@stat")
+                if resp_stat and resp_stat != "ok" and needs_token:
+                    print(f"[AUTH] Auth failure on {endpoint}, re-authenticating...")
+                    new_token, ok = authenticate(base_url, args.username, password)
+                    if ok:
+                        token = new_token
+                        last_auth_time = time.monotonic()
+                        auth_refreshed = True
+                        results[endpoint] = poll_endpoint(base_url, endpoint, token)
+                    else:
+                        print(f"[AUTH] Re-authentication failed")
+            except Exception as e:
+                results[endpoint] = {"error": str(e)}
+                failures += 1
+
+        if failures == len(ALL_ENDPOINTS):
+            status = "ALL FAILED"
+        elif failures > 0:
+            status = f"PARTIAL ({failures} failures)"
+        else:
+            status = "OK"
+
+        entry = {
+            "timestamp": now.isoformat(),
+            "poll_count": poll_count,
+            "status": status,
+            "auth_refreshed": auth_refreshed,
+            **results,
+        }
+        write_jsonl(entry)
+
+        flag = " [AUTH REFRESHED]" if auth_refreshed else ""
+        print(f"[{now.strftime('%H:%M:%S')}] Poll #{poll_count} — {status}{flag}")
+
+        time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
