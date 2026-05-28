@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""SFR Box monitor — continuous polling of 9 endpoints with JSONL logging."""
+"""SFR Box monitor — continuous polling with crash detection and rapid mode."""
 
 import argparse
 import hashlib
 import hmac
 import json
 import os
+import subprocess
 import sys
 import time
 from collections import defaultdict
@@ -34,8 +35,11 @@ PRIVATE_ENDPOINTS = [
 
 ALL_ENDPOINTS = PUBLIC_ENDPOINTS + PRIVATE_ENDPOINTS
 
-AUTH_REFRESH_INTERVAL = 3600  # 60 minutes
-POLL_INTERVAL = 60  # seconds
+AUTH_REFRESH_INTERVAL = 3600
+POLL_INTERVAL = 60
+
+CRASH_POLL_INTERVAL = 10
+CRASH_MODE_MAX_DURATION = 300  # 5 minutes
 
 
 def etree_to_dict(t: ElementTree.Element) -> dict:
@@ -117,25 +121,110 @@ def write_jsonl(entry: dict) -> None:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-def poll_cycle(base_url: str, token: str) -> dict:
-    results: dict[str, dict] = {}
-    failures = 0
-    auth_refreshed = False
+def notify_macos(title: str, message: str) -> None:
+    if sys.platform != "darwin":
+        return
+    try:
+        subprocess.run(
+            ["osascript", "-e", f'display notification "{message}" with title "{title}"'],
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:
+        pass
 
-    for endpoint in ALL_ENDPOINTS:
+
+def extract_uptime(system_info: dict) -> int | None:
+    try:
+        return int(system_info["rsp"]["status"]["@uptime"])
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def extract_client_count(client_list: dict) -> int:
+    try:
+        hosts = client_list["rsp"]["clients"]["client"]
+        if isinstance(hosts, list):
+            return len(hosts)
+        return 1
+    except (KeyError, TypeError):
+        return 0
+
+
+def run_crash_mode(
+    base_url: str,
+    token: str,
+    username: str,
+    password: str,
+    pre_crash_uptime: int,
+    pre_crash_client_count: int,
+    poll_count: int,
+) -> int:
+    print(f"\n{'='*60}")
+    print(f"  *** CRASH DETECTED ***  Uptime reset from {pre_crash_uptime}s")
+    print(f"  Entering rapid polling mode (10s interval, max 5 min)")
+    print(f"{'='*60}\n")
+    notify_macos("SFR Box", "Crash detected — uptime reset")
+
+    crash_start = time.monotonic()
+    while True:
+        elapsed = time.monotonic() - crash_start
+        if elapsed >= CRASH_MODE_MAX_DURATION:
+            print(f"[CRASH MODE] 5-minute cap reached, returning to normal polling")
+            break
+
+        poll_count += 1
+        now = datetime.now(timezone.utc)
+
         try:
-            results[endpoint] = poll_endpoint(base_url, endpoint, token if endpoint in PRIVATE_ENDPOINTS else None)
+            system_info = poll_endpoint(base_url, "system.getInfo")
+            client_list = poll_endpoint(base_url, "wlan.getClientList", token)
         except Exception as e:
-            results[endpoint] = {"error": str(e)}
-            failures += 1
+            entry = {
+                "timestamp": now.isoformat(),
+                "poll_count": poll_count,
+                "crash_detected": True,
+                "rapid_mode": True,
+                "pre_crash_uptime": pre_crash_uptime,
+                "error": str(e),
+            }
+            write_jsonl(entry)
+            print(f"[CRASH MODE #{poll_count}] Error: {e}")
+            time.sleep(CRASH_POLL_INTERVAL)
+            continue
 
-    status = "OK"
-    if failures == len(ALL_ENDPOINTS):
-        status = "ALL FAILED"
-    elif failures > 0:
-        status = f"PARTIAL ({failures} failures)"
+        current_uptime = extract_uptime(system_info)
+        current_clients = extract_client_count(client_list)
 
-    return {"results": results, "status": status, "auth_refreshed": auth_refreshed}
+        uptime_climbing = current_uptime is not None and current_uptime > 0
+        clients_returning = current_clients >= (pre_crash_client_count * 0.5)
+
+        recovered = uptime_climbing and clients_returning
+
+        entry = {
+            "timestamp": now.isoformat(),
+            "poll_count": poll_count,
+            "crash_detected": True,
+            "rapid_mode": not recovered,
+            "pre_crash_uptime": pre_crash_uptime,
+            "current_uptime": current_uptime,
+            "current_clients": current_clients,
+            "system.getInfo": system_info,
+            "wlan.getClientList": client_list,
+        }
+        write_jsonl(entry)
+
+        status_tag = "RECOVERING" if not recovered else "RECOVERED"
+        print(f"[CRASH MODE #{poll_count}] uptime={current_uptime}s clients={current_clients} [{status_tag}]")
+
+        if recovered:
+            print(f"\n[CRASH MODE] Recovery detected — uptime climbing, {current_clients} clients back")
+            notify_macos("SFR Box", f"Recovered — uptime climbing, {current_clients} clients back")
+            break
+
+        time.sleep(CRASH_POLL_INTERVAL)
+
+    return poll_count
 
 
 def main() -> None:
@@ -155,6 +244,8 @@ def main() -> None:
     print("[AUTH] OK — initial token obtained")
     poll_count = 0
     last_auth_time = time.monotonic()
+    previous_uptime: int | None = None
+    pre_crash_client_count = 0
 
     while True:
         poll_count += 1
@@ -193,6 +284,21 @@ def main() -> None:
                 results[endpoint] = {"error": str(e)}
                 failures += 1
 
+        current_uptime = extract_uptime(results.get("system.getInfo", {}))
+
+        crash_detected = False
+        if previous_uptime is not None and current_uptime is not None:
+            if current_uptime < previous_uptime:
+                crash_detected = True
+
+        if current_uptime is not None:
+            previous_uptime = current_uptime
+
+        for ep in ("wlan.getClientList", "wlan5.getClientList"):
+            if ep in results and "error" not in results[ep]:
+                pre_crash_client_count = extract_client_count(results[ep])
+                break
+
         if failures == len(ALL_ENDPOINTS):
             status = "ALL FAILED"
         elif failures > 0:
@@ -211,6 +317,13 @@ def main() -> None:
 
         flag = " [AUTH REFRESHED]" if auth_refreshed else ""
         print(f"[{now.strftime('%H:%M:%S')}] Poll #{poll_count} — {status}{flag}")
+
+        if crash_detected:
+            poll_count = run_crash_mode(
+                base_url, token, args.username, password,
+                previous_uptime or 0, pre_crash_client_count, poll_count,
+            )
+            previous_uptime = None
 
         time.sleep(POLL_INTERVAL)
 
