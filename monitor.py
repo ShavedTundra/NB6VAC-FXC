@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SFR Box monitor — continuous polling with crash detection and rapid mode."""
+"""SFR Box monitor — continuous polling with crash detection and unreachable handling."""
 
 import argparse
 import hashlib
@@ -39,7 +39,13 @@ AUTH_REFRESH_INTERVAL = 3600
 POLL_INTERVAL = 60
 
 CRASH_POLL_INTERVAL = 10
-CRASH_MODE_MAX_DURATION = 300  # 5 minutes
+CRASH_MODE_MAX_DURATION = 300
+
+UNREACHABLE_PHASES = [
+    {"interval": 10, "duration": 120},    # Phase 1: 10s for 2 min
+    {"interval": 60, "duration": 600},    # Phase 2: 60s for 10 min
+    {"interval": 300, "duration": None},  # Phase 3: 5 min indefinitely
+]
 
 
 def etree_to_dict(t: ElementTree.Element) -> dict:
@@ -227,6 +233,62 @@ def run_crash_mode(
     return poll_count
 
 
+def run_unreachable_mode(
+    base_url: str,
+    error_message: str,
+    poll_count: int,
+) -> tuple[int, bool, str | None]:
+    print(f"\n{'='*60}")
+    print(f"  *** BOX UNREACHABLE ***  All API calls failing")
+    print(f"  Entering unreachable mode with escalating backoff")
+    print(f"{'='*60}\n")
+    notify_macos("SFR Box", "Box unreachable — all API calls failing")
+
+    notified_recovery = False
+    uptime_on_recovery: str | None = None
+
+    for phase_idx, phase in enumerate(UNREACHABLE_PHASES):
+        phase_num = phase_idx + 1
+        phase_start = time.monotonic()
+        phase_interval = phase["interval"]
+        phase_duration = phase["duration"]
+
+        while True:
+            poll_count += 1
+            now = datetime.now(timezone.utc)
+
+            entry = {
+                "timestamp": now.isoformat(),
+                "poll_count": poll_count,
+                "box_unreachable": True,
+                "phase": phase_num,
+                "error": error_message,
+            }
+            write_jsonl(entry)
+
+            print(f"[UNREACHABLE phase={phase_num} #{poll_count}] {error_message}")
+
+            try:
+                r = requests.get(f"{base_url}?method=system.getInfo", timeout=10)
+                data = parse_xml_response(r.content)
+                if data.get("rsp", {}).get("@stat") == "ok":
+                    uptime_on_recovery = data["rsp"]["status"]["@uptime"]
+                    print(f"\n[UNREACHABLE] Box is back online!")
+                    notify_macos("SFR Box", "Box back online")
+                    return poll_count, True, uptime_on_recovery
+            except Exception as e:
+                error_message = str(e)
+
+            time.sleep(phase_interval)
+
+            if phase_duration is not None and time.monotonic() - phase_start >= phase_duration:
+                break
+            if phase_duration is None:
+                continue
+
+    return poll_count, False, None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="SFR Box continuous monitor")
     parser.add_argument("--hostname", default="192.168.1.1", help="Box hostname or IP (default: 192.168.1.1)")
@@ -264,6 +326,7 @@ def main() -> None:
 
         results: dict[str, dict] = {}
         failures = 0
+        last_error = ""
 
         for endpoint in ALL_ENDPOINTS:
             needs_token = endpoint in PRIVATE_ENDPOINTS
@@ -280,9 +343,42 @@ def main() -> None:
                         results[endpoint] = poll_endpoint(base_url, endpoint, token)
                     else:
                         print(f"[AUTH] Re-authentication failed")
+            except requests.exceptions.ConnectionError as e:
+                results[endpoint] = {"error": str(e)}
+                failures += 1
+                last_error = str(e)
+            except requests.exceptions.Timeout as e:
+                results[endpoint] = {"error": str(e)}
+                failures += 1
+                last_error = str(e)
             except Exception as e:
                 results[endpoint] = {"error": str(e)}
                 failures += 1
+                last_error = str(e)
+
+        if failures == len(ALL_ENDPOINTS):
+            poll_count, recovered, uptime_str = run_unreachable_mode(
+                base_url, last_error, poll_count,
+            )
+            if recovered and uptime_str is not None:
+                try:
+                    recovered_uptime = int(uptime_str)
+                    if previous_uptime is not None and recovered_uptime < previous_uptime:
+                        print(f"[RECOVERY] Uptime reset detected ({recovered_uptime}s < {previous_uptime}s), triggering crash mode")
+                        poll_count = run_crash_mode(
+                            base_url, token, args.username, password,
+                            previous_uptime, pre_crash_client_count, poll_count,
+                        )
+                    previous_uptime = recovered_uptime
+                except (ValueError, TypeError):
+                    pass
+
+                new_token, ok = authenticate(base_url, args.username, password)
+                if ok:
+                    token = new_token
+                    last_auth_time = time.monotonic()
+
+            continue
 
         current_uptime = extract_uptime(results.get("system.getInfo", {}))
 
@@ -299,9 +395,7 @@ def main() -> None:
                 pre_crash_client_count = extract_client_count(results[ep])
                 break
 
-        if failures == len(ALL_ENDPOINTS):
-            status = "ALL FAILED"
-        elif failures > 0:
+        if failures > 0:
             status = f"PARTIAL ({failures} failures)"
         else:
             status = "OK"
