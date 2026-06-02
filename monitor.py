@@ -456,7 +456,7 @@ def tick_unreachable(
     try:
         data = sfr_box.poll_endpoint(config.base_url, "system.getInfo")
         if data.get("rsp", {}).get("@stat") == "ok":
-            recovered_uptime = int(data["rsp"]["status"]["@uptime"])
+            recovered_uptime = extract_uptime(data)
             entry["recovered"] = True
 
             # Uptime reset → CRASH, else → NORMAL
@@ -478,7 +478,7 @@ def tick_unreachable(
                     pre_crash_client_count=state.pre_crash_client_count,
                 )
             return new_state, entry
-    except Exception as e:
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, ElementTree.ParseError) as e:
         return MonitorState(
             mode=Mode.UNREACHABLE, poll_count=new_count, token=state.token,
             last_auth_time=state.last_auth_time,
