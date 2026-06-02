@@ -15,6 +15,7 @@ from enum import Enum
 from pathlib import Path
 
 import requests
+from xml.etree import ElementTree
 
 import sfr_box
 
@@ -121,11 +122,8 @@ def notify_macos(title: str, message: str) -> None:
         pass
 
 
-def extract_uptime(system_info: dict) -> int | None:
-    try:
-        return int(system_info["rsp"]["status"]["@uptime"])
-    except (KeyError, ValueError, TypeError):
-        return None
+def extract_uptime(system_info: dict) -> int:
+    return int(system_info["rsp"]["system"]["@uptime"])
 
 
 def extract_client_count(client_list: dict) -> int:
@@ -224,7 +222,7 @@ def poll_all_endpoints(
             results[endpoint] = {"error": str(e)}
             failures += 1
             last_error = str(e)
-        except Exception as e:
+        except ElementTree.ParseError as e:
             results[endpoint] = {"error": str(e)}
             failures += 1
             last_error = str(e)
