@@ -20,12 +20,12 @@ from xml.etree import ElementTree
 import sfr_box
 
 ALL_ENDPOINTS = [
-    "system.getInfo", "wan.getInfo", "ppp.getInfo", "dsl.getInfo",
+    "system.getInfo", "wan.getInfo",
     "ftth.getInfo", "ont.getInfo", "lan.getHostsList",
-    "wlan.getClientList", "wlan5.getClientList",
+    "wlan5.getClientList",
 ]
 
-CLIENT_LIST_ENDPOINTS = {"wlan.getClientList", "wlan5.getClientList", "lan.getHostsList"}
+CLIENT_LIST_ENDPOINTS = {"wlan5.getClientList", "lan.getHostsList"}
 
 
 class Mode(Enum):
@@ -46,13 +46,12 @@ class MonitorConfig:
     baseline_polls: int = 3
     baseline_interval: int = 10
     auth_refresh_interval: int = 3600
-    repeater_mac: str = "6C:4C:BC:91:DF:A9"
     public_endpoints: list[str] = field(default_factory=lambda: [
-        "system.getInfo", "wan.getInfo", "ppp.getInfo", "dsl.getInfo",
+        "system.getInfo", "wan.getInfo",
         "ftth.getInfo", "ont.getInfo", "lan.getHostsList",
     ])
     private_endpoints: list[str] = field(default_factory=lambda: [
-        "wlan.getClientList", "wlan5.getClientList",
+        "wlan5.getClientList",
     ])
     unreachable_phases: list[dict] = field(default_factory=lambda: [
         {"interval": 10, "duration": 120},
@@ -72,7 +71,6 @@ class MonitorState:
     token: str
     last_auth_time: float
     previous_uptime: int | None
-    pre_crash_client_count: int
     baseline_polls_done: int = 0
     crash_start: float = 0.0
     pre_crash_uptime: int = 0
@@ -82,7 +80,7 @@ class MonitorState:
 
 
 # ---------------------------------------------------------------------------
-# Helpers (unchanged logic)
+# Helpers
 # ---------------------------------------------------------------------------
 
 def get_password() -> str:
@@ -126,65 +124,8 @@ def extract_uptime(system_info: dict) -> int:
     return int(system_info["rsp"]["system"]["@uptime"])
 
 
-def extract_client_count(client_list: dict) -> int:
-    try:
-        hosts = client_list["rsp"]["clients"]["client"]
-        if isinstance(hosts, list):
-            return len(hosts)
-        return 1
-    except (KeyError, TypeError):
-        return 0
-
-
-def tag_repeater_in_results(results: dict[str, dict], repeater_mac: str) -> None:
-    for endpoint in CLIENT_LIST_ENDPOINTS:
-        if endpoint not in results or "error" in results[endpoint]:
-            continue
-        try:
-            clients_data = results[endpoint]["rsp"]
-            if "clients" in clients_data:
-                client = clients_data["clients"]["client"]
-            elif "hosts" in clients_data:
-                client = clients_data["hosts"]["host"]
-            else:
-                continue
-            clients = client if isinstance(client, list) else [client]
-            for c in clients:
-                mac = c.get("@mac", c.get("@MAC", "")).upper()
-                if mac == repeater_mac:
-                    c["repeater"] = True
-        except (KeyError, TypeError):
-            continue
-
-
-def find_repeater_status(results: dict[str, dict], repeater_mac: str) -> tuple[bool, str | None]:
-    last_seen: str | None = None
-    for endpoint in CLIENT_LIST_ENDPOINTS:
-        if endpoint not in results or "error" in results[endpoint]:
-            continue
-        try:
-            clients_data = results[endpoint]["rsp"]
-            if "clients" in clients_data:
-                client = clients_data["clients"]["client"]
-            elif "hosts" in clients_data:
-                client = clients_data["hosts"]["host"]
-            else:
-                continue
-            clients = client if isinstance(client, list) else [client]
-            for c in clients:
-                mac = c.get("@mac", c.get("@MAC", "")).upper()
-                if mac == repeater_mac:
-                    ts = c.get("@last_seen", c.get("@assoc_time"))
-                    if ts is not None:
-                        last_seen = ts
-                    return True, last_seen
-        except (KeyError, TypeError):
-            continue
-    return False, None
-
-
 # ---------------------------------------------------------------------------
-# poll_all_endpoints — standalone helper for the 9-endpoint iteration
+# poll_all_endpoints — standalone helper for the 6-endpoint iteration
 # ---------------------------------------------------------------------------
 
 def poll_all_endpoints(
@@ -298,7 +239,6 @@ def tick_normal(
         new_state = MonitorState(
             mode=Mode.UNREACHABLE, poll_count=new_count, token=token,
             last_auth_time=last_auth, previous_uptime=state.previous_uptime,
-            pre_crash_client_count=state.pre_crash_client_count,
             unreachable_phase=0, unreachable_phase_start=now_mono,
             unreachable_error=last_error,
         )
@@ -309,9 +249,6 @@ def tick_normal(
         return new_state, entry
 
     # Partial or full success
-    tag_repeater_in_results(results, config.repeater_mac)
-    repeater_connected, repeater_last_seen = find_repeater_status(results, config.repeater_mac)
-
     current_uptime = extract_uptime(results.get("system.getInfo", {}))
     crash_detected = (
         state.previous_uptime is not None
@@ -319,22 +256,13 @@ def tick_normal(
         and current_uptime < state.previous_uptime
     )
 
-    pre_crash_client_count = state.pre_crash_client_count
-    for ep in ("wlan.getClientList", "wlan5.getClientList"):
-        if ep in results and "error" not in results[ep]:
-            pre_crash_client_count = extract_client_count(results[ep])
-            break
-
     status = f"PARTIAL ({failures} failures)" if failures > 0 else "OK"
     flag = " [AUTH REFRESHED]" if auth_refreshed else ""
-    rep_flag = " [REPEATER UP]" if repeater_connected else " [REPEATER DOWN]"
-    print(f"[{now_utc.strftime('%H:%M:%S')}] Poll #{new_count} — {status}{flag}{rep_flag}")
+    print(f"[{now_utc.strftime('%H:%M:%S')}] Poll #{new_count} — {status}{flag}")
 
     entry = {
         "timestamp": now_utc.isoformat(), "poll_count": new_count,
         "status": status, "auth_refreshed": auth_refreshed,
-        "repeater_connected": repeater_connected,
-        "repeater_last_seen": repeater_last_seen,
         **results,
     }
 
@@ -342,7 +270,6 @@ def tick_normal(
         new_state = MonitorState(
             mode=Mode.CRASH, poll_count=new_count, token=token,
             last_auth_time=last_auth, previous_uptime=None,
-            pre_crash_client_count=pre_crash_client_count,
             crash_start=now_mono, pre_crash_uptime=state.previous_uptime or 0,
         )
     else:
@@ -350,7 +277,6 @@ def tick_normal(
             mode=Mode.NORMAL, poll_count=new_count, token=token,
             last_auth_time=last_auth,
             previous_uptime=current_uptime if current_uptime is not None else state.previous_uptime,
-            pre_crash_client_count=pre_crash_client_count,
         )
 
     return new_state, entry
@@ -368,7 +294,6 @@ def tick_crash(
         new_state = MonitorState(
             mode=Mode.NORMAL, poll_count=new_count, token=state.token,
             last_auth_time=state.last_auth_time, previous_uptime=None,
-            pre_crash_client_count=state.pre_crash_client_count,
         )
         entry = {
             "timestamp": now_utc.isoformat(), "poll_count": new_count,
@@ -414,7 +339,6 @@ def tick_crash(
         new_state = MonitorState(
             mode=Mode.NORMAL, poll_count=new_count, token=state.token,
             last_auth_time=state.last_auth_time, previous_uptime=current_uptime,
-            pre_crash_client_count=state.pre_crash_client_count,
         )
         return new_state, entry
 
@@ -442,7 +366,6 @@ def tick_unreachable(
         "timestamp": now_utc.isoformat(), "poll_count": new_count,
         "box_unreachable": True, "phase": phase_idx + 1,
         "error": state.unreachable_error,
-        "repeater_connected": False, "repeater_last_seen": None,
     }
     print(f"[UNREACHABLE phase={phase_idx + 1} #{new_count}] {state.unreachable_error}")
 
@@ -459,7 +382,6 @@ def tick_unreachable(
                     mode=Mode.CRASH, poll_count=new_count, token=state.token,
                     last_auth_time=state.last_auth_time,
                     previous_uptime=state.previous_uptime,
-                    pre_crash_client_count=state.pre_crash_client_count,
                     crash_start=now_mono, pre_crash_uptime=state.previous_uptime,
                 )
             else:
@@ -469,7 +391,6 @@ def tick_unreachable(
                     token=new_token if ok else state.token,
                     last_auth_time=now_mono if ok else state.last_auth_time,
                     previous_uptime=recovered_uptime,
-                    pre_crash_client_count=state.pre_crash_client_count,
                 )
             return new_state, entry
     except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, ElementTree.ParseError) as e:
@@ -477,7 +398,6 @@ def tick_unreachable(
             mode=Mode.UNREACHABLE, poll_count=new_count, token=state.token,
             last_auth_time=state.last_auth_time,
             previous_uptime=state.previous_uptime,
-            pre_crash_client_count=state.pre_crash_client_count,
             unreachable_phase=phase_idx,
             unreachable_phase_start=now_mono if phase_idx != state.unreachable_phase else state.unreachable_phase_start,
             unreachable_error=str(e),
@@ -488,7 +408,6 @@ def tick_unreachable(
         mode=Mode.UNREACHABLE, poll_count=new_count, token=state.token,
         last_auth_time=state.last_auth_time,
         previous_uptime=state.previous_uptime,
-        pre_crash_client_count=state.pre_crash_client_count,
         unreachable_phase=phase_idx,
         unreachable_phase_start=now_mono if phase_idx != state.unreachable_phase else state.unreachable_phase_start,
         unreachable_error=state.unreachable_error,
@@ -579,7 +498,7 @@ def main() -> None:
     state = MonitorState(
         mode=Mode.BASELINE, poll_count=0, token=token,
         last_auth_time=time.monotonic(),
-        previous_uptime=None, pre_crash_client_count=0,
+        previous_uptime=None,
     )
     print(f"[BASELINE] Starting {config.baseline_polls} baseline polls ({config.baseline_interval}s apart)...")
 
