@@ -242,7 +242,7 @@ def tick_baseline(
 
     try:
         system_info = sfr_box.poll_endpoint(config.base_url, "system.getInfo")
-    except Exception as e:
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, ElementTree.ParseError) as e:
         print(f"[BASELINE] Poll FAILED: {e}", file=sys.stderr)
         print("ERROR: Baseline failed — API unreachable or auth error. Exiting.", file=sys.stderr)
         sys.exit(1)
@@ -379,8 +379,8 @@ def tick_crash(
 
     try:
         system_info = sfr_box.poll_endpoint(config.base_url, "system.getInfo")
-        client_list = sfr_box.poll_endpoint(config.base_url, "wlan.getClientList", state.token)
-    except Exception as e:
+        wan_info = sfr_box.poll_endpoint(config.base_url, "wan.getInfo")
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, ElementTree.ParseError) as e:
         entry = {
             "timestamp": now_utc.isoformat(), "poll_count": new_count,
             "crash_detected": True, "rapid_mode": True,
@@ -390,37 +390,31 @@ def tick_crash(
         return replace(state, poll_count=new_count), entry
 
     current_uptime = extract_uptime(system_info)
-    current_clients = extract_client_count(client_list)
-    uptime_climbing = current_uptime is not None and current_uptime > 0
-    clients_returning = current_clients >= (state.pre_crash_client_count * 0.5)
-    recovered = uptime_climbing and clients_returning
+    wan_status = wan_info["rsp"]["wan"]["@status"]
+    recovered = current_uptime < 600 and wan_status == "up"
 
     crash_results: dict[str, dict] = {
         "system.getInfo": system_info,
-        "wlan.getClientList": client_list,
+        "wan.getInfo": wan_info,
     }
-    tag_repeater_in_results(crash_results, config.repeater_mac)
-    repeater_connected, repeater_last_seen = find_repeater_status(crash_results, config.repeater_mac)
 
     status_tag = "RECOVERING" if not recovered else "RECOVERED"
-    print(f"[CRASH MODE #{new_count}] uptime={current_uptime}s clients={current_clients} [{status_tag}]")
+    print(f"[CRASH MODE #{new_count}] uptime={current_uptime}s wan={wan_status} [{status_tag}]")
 
     entry = {
         "timestamp": now_utc.isoformat(), "poll_count": new_count,
         "crash_detected": True, "rapid_mode": not recovered,
         "pre_crash_uptime": state.pre_crash_uptime,
-        "current_uptime": current_uptime, "current_clients": current_clients,
-        "repeater_connected": repeater_connected,
-        "repeater_last_seen": repeater_last_seen,
+        "current_uptime": current_uptime, "wan_status": wan_status,
         **crash_results,
     }
 
     if recovered:
-        print(f"[CRASH MODE] Recovery detected — uptime climbing, {current_clients} clients back")
+        print(f"[CRASH MODE] Recovery detected — fresh uptime {current_uptime}s, WAN is up")
         new_state = MonitorState(
             mode=Mode.NORMAL, poll_count=new_count, token=state.token,
             last_auth_time=state.last_auth_time, previous_uptime=current_uptime,
-            pre_crash_client_count=current_clients,
+            pre_crash_client_count=state.pre_crash_client_count,
         )
         return new_state, entry
 
