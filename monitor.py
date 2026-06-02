@@ -74,6 +74,7 @@ class MonitorState:
     baseline_polls_done: int = 0
     crash_start: float = 0.0
     pre_crash_uptime: int = 0
+    crash_context: dict | None = None
     unreachable_phase: int = 0
     unreachable_phase_start: float = 0.0
     unreachable_error: str = ""
@@ -267,10 +268,29 @@ def tick_normal(
     }
 
     if crash_detected:
+        # Build crash_context from the last successful normal poll
+        sys_rsp = results.get("system.getInfo", {}).get("rsp", {}).get("system", {})
+        wan_rsp = results.get("wan.getInfo", {}).get("rsp", {}).get("wan", {})
+        lan_rsp = results.get("lan.getHostsList", {}).get("rsp", {})
+        hosts = lan_rsp.get("host")
+        if isinstance(hosts, list):
+            host_count = len(hosts)
+        elif isinstance(hosts, dict):
+            host_count = 1
+        else:
+            host_count = 0
+        crash_context = {
+            "temperature": int(sys_rsp["@temperature"]) if "@temperature" in sys_rsp else None,
+            "voltage": float(sys_rsp["@alimvoltage"]) if "@alimvoltage" in sys_rsp else None,
+            "uptime": state.previous_uptime,
+            "wan_status": wan_rsp.get("@status"),
+            "host_count": host_count,
+        }
         new_state = MonitorState(
             mode=Mode.CRASH, poll_count=new_count, token=token,
             last_auth_time=last_auth, previous_uptime=None,
             crash_start=now_mono, pre_crash_uptime=state.previous_uptime or 0,
+            crash_context=crash_context,
         )
     else:
         new_state = MonitorState(
@@ -312,7 +332,7 @@ def tick_crash(
             "pre_crash_uptime": state.pre_crash_uptime, "error": str(e),
         }
         print(f"[CRASH MODE #{new_count}] Error: {e}")
-        return replace(state, poll_count=new_count), entry
+        return replace(state, poll_count=new_count, crash_context=None), entry
 
     current_uptime = extract_uptime(system_info)
     wan_status = wan_info["rsp"]["wan"]["@status"]
@@ -326,13 +346,15 @@ def tick_crash(
     status_tag = "RECOVERING" if not recovered else "RECOVERED"
     print(f"[CRASH MODE #{new_count}] uptime={current_uptime}s wan={wan_status} [{status_tag}]")
 
-    entry = {
+    entry: dict = {
         "timestamp": now_utc.isoformat(), "poll_count": new_count,
         "crash_detected": True, "rapid_mode": not recovered,
         "pre_crash_uptime": state.pre_crash_uptime,
         "current_uptime": current_uptime, "wan_status": wan_status,
         **crash_results,
     }
+    if state.crash_context is not None:
+        entry["crash_context"] = state.crash_context
 
     if recovered:
         print(f"[CRASH MODE] Recovery detected — fresh uptime {current_uptime}s, WAN is up")
@@ -342,7 +364,7 @@ def tick_crash(
         )
         return new_state, entry
 
-    return replace(state, poll_count=new_count), entry
+    return replace(state, poll_count=new_count, crash_context=None), entry
 
 
 def tick_unreachable(
