@@ -62,6 +62,14 @@ def authenticate(base_url: str, username: str, password: str) -> tuple[str, bool
     return token, True
 
 
+def extract_uptime(system_info: dict) -> int:
+    """Extract uptime in seconds from a system.getInfo response.
+
+    Raises KeyError when the expected path (rsp.system.@uptime) is absent.
+    """
+    return int(system_info["rsp"]["system"]["@uptime"])
+
+
 def poll_endpoint(base_url: str, method: str, token: str | None = None) -> dict:
     """Poll a single API endpoint and return parsed XML as dict."""
     url = f"{base_url}?method={method}"

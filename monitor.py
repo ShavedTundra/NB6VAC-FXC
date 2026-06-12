@@ -121,8 +121,6 @@ def notify_macos(title: str, message: str) -> None:
         pass
 
 
-def extract_uptime(system_info: dict) -> int:
-    return int(system_info["rsp"]["system"]["@uptime"])
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +248,7 @@ def tick_normal(
         return new_state, entry
 
     # Partial or full success
-    current_uptime = extract_uptime(results.get("system.getInfo", {}))
+    current_uptime = sfr_box.extract_uptime(results["system.getInfo"])
     crash_detected = (
         state.previous_uptime is not None
         and current_uptime is not None
@@ -334,7 +332,7 @@ def tick_crash(
         print(f"[CRASH MODE #{new_count}] Error: {e}")
         return replace(state, poll_count=new_count, crash_context=None), entry
 
-    current_uptime = extract_uptime(system_info)
+    current_uptime = sfr_box.extract_uptime(system_info)
     wan_status = wan_info["rsp"]["wan"]["@status"]
     recovered = current_uptime < 600 and wan_status == "up"
 
@@ -395,7 +393,7 @@ def tick_unreachable(
     try:
         data = sfr_box.poll_endpoint(config.base_url, "system.getInfo")
         if data.get("rsp", {}).get("@stat") == "ok":
-            recovered_uptime = extract_uptime(data)
+            recovered_uptime = sfr_box.extract_uptime(data)
             entry["recovered"] = True
 
             # Uptime reset → CRASH, else → NORMAL

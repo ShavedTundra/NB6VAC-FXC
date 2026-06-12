@@ -38,18 +38,14 @@ def get_password() -> str:
 
 
 def get_uptime_hours(base_url: str, token: str) -> float | None:
-    """Get current uptime in hours from system.getInfo."""
-    data = sfr_box.poll_endpoint(base_url, "system.getInfo", token)
-    rsp = data.get("rsp", {})
-    system = rsp.get("system", {})
-    if not isinstance(system, dict):
-        return None
-    uptime_s = system.get("@uptime")
-    if uptime_s is None:
-        return None
+    """Get current uptime in hours from system.getInfo.
+
+    Returns None if uptime cannot be extracted (malformed response).
+    """
     try:
-        return int(uptime_s) / 3600
-    except (ValueError, TypeError):
+        data = sfr_box.poll_endpoint(base_url, "system.getInfo", token)
+        return sfr_box.extract_uptime(data) / 3600
+    except (KeyError, ValueError):
         return None
 
 
