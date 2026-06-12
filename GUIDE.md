@@ -10,8 +10,9 @@ Complete guide to set up, run, and draw conclusions from the SFR Box monitoring 
 2. [Configuration](#2-configuration)
 3. [API Client](#3-api-client)
 4. [Monitor](#4-monitor)
-5. [Understanding the Logs](#5-understanding-the-logs)
-6. [First Conclusions (4–7 Days)](#6-first-conclusions-47-days)
+5. [Reboot Tool](#5-reboot-tool)
+6. [Understanding the Logs](#6-understanding-the-logs)
+7. [First Conclusions (4–7 Days)](#7-first-conclusions-47-days)
 
 ---
 
@@ -103,6 +104,8 @@ python client.py --hostname 192.168.1.1 --username admin --password admin
 | WiFi clients (5 GHz) | `wlan5` → `getClientList` |
 | LAN hosts | `lan` → `getHostsList` |
 | PPP session info | `ppp` → `getInfo` |
+
+> **Note:** `dsl.getInfo` and `ppp.getInfo` are dead endpoints for FTTH boxes — they timeout or return empty data. They are excluded from the monitor but remain available in the API client for ad-hoc exploration.
 
 ---
 
@@ -231,37 +234,36 @@ STARTUP
 
 - **When**: After baseline succeeds. This is the steady state.
 - **Cadence**: Every 60 seconds.
-- **Endpoints polled** (9 total):
+- **Endpoints polled** (6 active endpoints):
 
 | Endpoint | Auth | What it returns |
 |---|---|---|
-| `system.getInfo` | public | Uptime, firmware version, model |
+| `system.getInfo` | public | Uptime, temperature, voltage, firmware version |
 | `wan.getInfo` | public | WAN connection status |
-| `ppp.getInfo` | public | PPP session info |
-| `dsl.getInfo` | public | DSL line stats (SNR, attenuation) |
 | `ftth.getInfo` | public | FTTH status |
-| `ont.getInfo` | public | ONT status |
+| `ont.getInfo` | public | ONT (fiber terminal) status |
 | `lan.getHostsList` | public | All LAN hosts |
-| `wlan.getClientList` | private | 2.4 GHz WiFi clients |
 | `wlan5.getClientList` | private | 5 GHz WiFi clients |
 
+> **Dead endpoints** (not polled — FTTH box has no DSL/PPPoE, and 2.4 GHz has no clients): `dsl.getInfo`, `ppp.getInfo`, `wlan.getClientList`.
+
 - **Auth token refresh**: Every 3600 seconds (1 hour), proactively re-authenticates. If a private endpoint returns an auth error mid-poll, re-authenticates immediately.
-- **Repeater tagging**: Any client with MAC `6C:4C:BC:91:DF:A9` gets `"repeater": true` in the log entry, and `repeater_connected` / `repeater_last_seen` are set at the top level.
-- **Log**: Each poll produces one JSONL entry with all 9 endpoint results.
+- **Log**: Each poll produces one JSONL entry with all 6 endpoint results.
 
 #### Mode 3: Crash detection
 
 - **When**: Uptime drops between two consecutive polls (box rebooted without going fully unreachable).
 - **What**: Enters rapid polling at **10-second intervals** for up to **5 minutes**:
-  - Polls `system.getInfo` + `wlan.getClientList`
-  - Checks if uptime is climbing and client count is recovering (≥50% of pre-crash count)
+  - Polls `system.getInfo` + `wan.getInfo`
+  - Declares recovery when uptime < 600s AND `wan.getInfo` reports status `"up"`
   - Once recovered, exits crash mode and returns to normal polling
+- **Crash context**: On detection, the last-known-good vitals (temperature, voltage, uptime, WAN status, host count) are captured and logged as structured data in the first CRASH-mode entry.
 - **Notifications**: macOS notification on crash detection and on recovery.
-- **Log**: Entries have `"crash_detected": true`, `"rapid_mode": true/false`, `"pre_crash_uptime"`.
+- **Log**: Entries have `"crash_detected": true`, `"rapid_mode": true/false`, `"pre_crash_uptime"`. First entry includes `"crash_context"` with last-known-good vitals.
 
 #### Mode 4: Unreachable (dead box)
 
-- **When**: All 9 endpoints fail (connection refused/timeout — the box is completely down or network is cut).
+- **When**: All 6 endpoints fail (connection refused/timeout — the box is completely down or network is cut).
 - **What**: Escalating backoff in 3 phases:
 
 | Phase | Interval | Duration | Cumulative |
@@ -284,15 +286,80 @@ STARTUP
 [BASELINE] Poll 2/3 OK
 [BASELINE] Poll 3/3 OK
 [BASELINE] All 3 baseline polls succeeded — entering main loop
-[14:32:01] Poll #4 — OK [REPEATER UP]
-[14:33:01] Poll #5 — OK [REPEATER UP]
+[14:32:01] Poll #4 — OK
+[14:33:01] Poll #5 — OK
 [AUTH] Token refreshed proactively
-[14:34:01] Poll #6 — OK [AUTH REFRESHED] [REPEATER DOWN]
+[14:34:01] Poll #6 — OK [AUTH REFRESHED]
 ```
 
 ---
 
-## 5. Understanding the Logs
+## 5. Reboot Tool
+
+A CLI tool to reboot the SFR Box via the API (soft reboot) or a smart plug (hard power cycle). Also supports scheduled reboot mode — only reboots if uptime exceeds a threshold.
+
+### Launch
+
+```bash
+# Soft reboot (via API)
+python reboot.py --hostname 192.168.1.1
+
+# Hard reboot (via smart plug — requires SMART_PLUG_IP)
+SMART_PLUG_IP=192.168.1.50 python reboot.py --hard
+
+# Scheduled: only reboot if uptime > 18 hours
+python reboot.py --scheduled
+
+# Hard scheduled: power cycle only if uptime > 18 hours
+python reboot.py --hard --scheduled --smart-plug-ip 192.168.1.50
+```
+
+### CLI Options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--hostname` | `192.168.1.1` | Box IP or hostname |
+| `--username` | `admin` | Auth username |
+| `--password` | *(from env/config)* | Box password (default: from `SFR_PASSWORD` or `config.local.json`) |
+| `--hard` | off | Hard power cycle via smart plug instead of API reboot |
+| `--scheduled` | off | Only reboot if uptime > 18h threshold |
+| `--smart-plug-ip` | *(from env)* | Smart plug IP (or set `SMART_PLUG_IP` env var) |
+
+### How It Works
+
+1. **Authentication** — Authenticates with the box and obtains a token (same flow as the monitor).
+2. **Uptime check** — Reads current uptime via `system.getInfo`. In `--scheduled` mode, exits early if uptime is below the 18h threshold (or if uptime is unreadable, it skips to be safe).
+3. **Reboot** — One of two paths:
+   - **Soft reboot** (`--hard` not set): Sends `system.reboot` via POST with the auth token. The box handles the restart internally.
+   - **Hard reboot** (`--hard`): Uses the smart plug to cut power for 30 seconds, then restores it. After power-on, waits up to 180 seconds for the box to respond to ping.
+
+### Smart Plug Support
+
+The hard reboot mode uses `smart_plug.py`, which automatically detects the plug brand by trying each protocol in order:
+
+| Brand | Protocol | URL pattern |
+|---|---|---|
+| Shelly Gen3 | RPC | `http://{ip}/rpc/Switch.Set?id=0&on=true` |
+| Shelly Gen1 | REST | `http://{ip}/relay/0?turn=on` |
+| Tasmota | HTTP | `http://{ip}/cm?cmnd=Power%20On` |
+
+No configuration needed — just provide the plug's IP address and the script auto-detects which protocol works.
+
+### Scheduled Reboot (Cron)
+
+Combine with cron for automatic preventive reboots:
+
+```bash
+# Reboot every 3 days at 04:00 if uptime > 18 hours
+0 4 */3 * * cd /path/to/NB6VAC-FXC && python reboot.py --scheduled >> logs/reboot.log 2>&1
+
+# Hard power cycle weekly at 03:00 if uptime > 18 hours
+0 3 * * 0 cd /path/to/NB6VAC-FXC && python reboot.py --hard --scheduled --smart-plug-ip 192.168.1.50 >> logs/reboot.log 2>&1
+```
+
+---
+
+## 6. Understanding the Logs
 
 Logs are written to `./logs/monitor_YYYY-MM-DD.jsonl` — one file per day, auto-rotated at midnight UTC.
 
@@ -306,12 +373,12 @@ Each line is a JSON object. Key fields:
   "poll_count": 42,                                  // sequential counter
   "status": "OK",                                    // "OK", "PARTIAL (N failures)"
   "auth_refreshed": false,
-  "repeater_connected": true,
-  "repeater_last_seen": "12345",
   "system.getInfo": { /* full API response */ },
   "wan.getInfo": { /* ... */ },
-  "dsl.getInfo": { /* ... */ },
-  // ... all 9 endpoints
+  "ftth.getInfo": { /* ... */ },
+  "ont.getInfo": { /* ... */ },
+  "lan.getHostsList": { /* ... */ },
+  "wlan5.getClientList": { /* ... */ }
 }
 ```
 
@@ -320,7 +387,7 @@ Each line is a JSON object. Key fields:
 | Condition | Extra Fields |
 |---|---|
 | Baseline | `"baseline": true` |
-| Crash detected | `"crash_detected": true`, `"rapid_mode": true/false`, `"pre_crash_uptime": 12345` |
+| Crash detected | `"crash_detected": true`, `"rapid_mode": true/false`, `"pre_crash_uptime": 12345`, `"crash_context": {...}` |
 | Box unreachable | `"box_unreachable": true`, `"phase": 1/2/3`, `"error": "..."` |
 | Partial failure | `"status": "PARTIAL (2 failures)"`, failed endpoints have `"error": "..."` |
 
@@ -333,6 +400,9 @@ wc -l logs/monitor_2026-05-2*.jsonl
 # Find all crash events
 grep '"crash_detected": true' logs/*.jsonl
 
+# Find all crash context entries (last-known-good vitals)
+grep '"crash_context"' logs/*.jsonl
+
 # Find all unreachable periods
 grep '"box_unreachable": true' logs/*.jsonl | head -5
 
@@ -343,33 +413,42 @@ for line in sys.stdin:
     e = json.loads(line)
     if 'system.getInfo' in e and 'error' not in e['system.getInfo']:
         try:
-            uptime = e['system.getInfo']['rsp']['status']['@uptime']
+            uptime = e['system.getInfo']['rsp']['system']['@uptime']
             print(f\"{e['timestamp'][:19]}  uptime={uptime}s\")
         except (KeyError, TypeError):
             pass
 "
 
-# Extract DSL SNR over time
+# Extract temperature and voltage over time
 cat logs/monitor_2026-05-28.jsonl | python -c "
 import sys, json
 for line in sys.stdin:
     e = json.loads(line)
-    if 'dsl.getInfo' in e and 'error' not in e['dsl.getInfo']:
+    if 'system.getInfo' in e and 'error' not in e['system.getInfo']:
         try:
-            dsl = e['dsl.getInfo']['rsp']['dsl']
-            print(f\"{e['timestamp'][:19]}  snr_down={dsl.get('@snr_down','?')}  snr_up={dsl.get('@snr_up','?')}\")
+            sys = e['system.getInfo']['rsp']['system']
+            print(f\"{e['timestamp'][:19]}  temp={sys.get('@temperature','?')}°C  volt={sys.get('@alimvoltage','?')}V\")
         except (KeyError, TypeError):
             pass
 "
 
-# Check repeater connectivity
-grep '"repeater_connected": true' logs/*.jsonl | wc -l
-grep '"repeater_connected": false' logs/*.jsonl | wc -l
+# Extract WAN status over time
+cat logs/monitor_2026-05-28.jsonl | python -c "
+import sys, json
+for line in sys.stdin:
+    e = json.loads(line)
+    if 'wan.getInfo' in e and 'error' not in e['wan.getInfo']:
+        try:
+            wan = e['wan.getInfo']['rsp']['wan']['@status']
+            print(f\"{e['timestamp'][:19]}  wan={wan}\")
+        except (KeyError, TypeError):
+            pass
+"
 ```
 
 ---
 
-## 6. First Conclusions (4–7 Days)
+## 7. First Conclusions (4–7 Days)
 
 After running the monitor continuously for 4–7 days, use this framework to draw your first conclusions.
 
@@ -388,18 +467,17 @@ After running the monitor continuously for 4–7 days, use this framework to dra
 - Extract max uptime before any reset. Was it days? Hours?
 - Did the box reboot on a schedule? (Some ISPs push updates overnight)
 
-### DSL/Fibre Line Quality
+### FTTH/Fibre Line Quality
 
-- **SNR margin** (`dsl.getInfo` → `@snr_down` / `@snr_up`): Stable or fluctuating wildly?
-  - SNR > 10 dB = good, < 6 dB = marginal, < 3 dB = problematic
-- **Attenuation** (`@atten_down` / `@atten_up`): Should be roughly constant. If it changes, something physical moved.
-- **Line rate** (`@rate_down` / `@rate_up`): Compare against your subscribed speed.
+- **ONT status** (`ont.getInfo`): Should show stable uptime (typically 100+ days). ONT stays up through box crashes.
+- **FTTH status** (`ftth.getInfo`): Check for any link status changes.
+- > **Note:** DSL/PPPoE endpoints are dead for FTTH boxes and not polled. Use the API client (`api-client/client.py`) for ad-hoc DSL queries if needed.
 
 ### WiFi & Clients
 
-- How many clients on average? (`wlan.getClientList` + `wlan5.getClientList`)
+- How many clients on average? (`wlan5.getClientList` for 5 GHz + `lan.getHostsList` for all LAN hosts)
 - Did any client repeatedly disconnect/reconnect?
-- Repeater (`6C:4C:BC:91:DF:A9`): What percentage of time was it connected?
+- > **Note:** The repeater is invisible to the box API due to MAC address translation on its backhaul. If the TV is online in `lan.getHostsList`, the repeater is working.
 
 ### WAN Connectivity
 
@@ -421,8 +499,8 @@ SNR down:   min=___ avg=___ max=___ dB
 SNR up:     min=___ avg=___ max=___ dB
 Line rate:  down=___ Mbps, up=___ Mbps
 
-WiFi clients: avg=___ min=___ max=___
-Repeater up:  ___% of polls
+WiFi clients (5 GHz): avg=___ min=___ max=___
+LAN hosts:          avg=___ min=___ max=___
 
 Notable events:
 - [date/time]: description
@@ -446,5 +524,9 @@ Conclusions:
 | View live log | `tail -f logs/monitor_$(date -u +%Y-%m-%d).jsonl` |
 | Count today's polls | `wc -l logs/monitor_$(date -u +%Y-%m-%d).jsonl` |
 | Find crashes | `grep '"crash_detected": true' logs/*.jsonl` |
+| Find crash context | `grep '"crash_context"' logs/*.jsonl` |
 | Find outages | `grep '"box_unreachable": true' logs/*.jsonl` |
+| Soft reboot | `python reboot.py` |
+| Hard reboot (smart plug) | `python reboot.py --hard --smart-plug-ip 192.168.1.50` |
+| Scheduled reboot (uptime > 18h) | `python reboot.py --scheduled` |
 | Launch API client | `cd api-client && python client.py` |
