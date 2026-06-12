@@ -18,6 +18,7 @@ from pathlib import Path
 import requests
 
 import sfr_box
+import smart_plug
 
 UPTIME_THRESHOLD_H = 18  # max hours before scheduled reboot triggers
 
@@ -95,62 +96,6 @@ def hard_reboot_via_ping(hostname: str) -> bool:
     return False
 
 
-def plug_off(plug_ip: str) -> None:
-    """Turn off a smart plug. Tries Shelly Gen3 RPC, then Shelly Gen1 REST, then Tasmota."""
-    # Shelly Gen2/Gen3 (RPC API)
-    try:
-        r = requests.get(f"http://{plug_ip}/rpc/Switch.Set?id=0&on=false", timeout=5)
-        if r.ok:
-            print(f"  Plug OFF (Shelly Gen3 RPC)")
-            return
-    except requests.RequestException:
-        pass
-    # Shelly Gen1 (REST API)
-    try:
-        r = requests.get(f"http://{plug_ip}/relay/0?turn=off", timeout=5)
-        if r.ok:
-            print(f"  Plug OFF (Shelly Gen1 REST)")
-            return
-    except requests.RequestException:
-        pass
-    # Tasmota
-    try:
-        r = requests.get(f"http://{plug_ip}/cm?cmnd=Power%20Off", timeout=5)
-        if r.ok:
-            print(f"  Plug OFF (Tasmota)")
-            return
-    except requests.RequestException:
-        pass
-    raise RuntimeError(f"Could not reach smart plug at {plug_ip}")
-
-
-def plug_on(plug_ip: str) -> None:
-    """Turn on a smart plug. Tries Shelly Gen3 RPC, then Shelly Gen1 REST, then Tasmota."""
-    # Shelly Gen2/Gen3 (RPC API)
-    try:
-        r = requests.get(f"http://{plug_ip}/rpc/Switch.Set?id=0&on=true", timeout=5)
-        if r.ok:
-            print(f"  Plug ON (Shelly Gen3 RPC)")
-            return
-    except requests.RequestException:
-        pass
-    # Shelly Gen1 (REST API)
-    try:
-        r = requests.get(f"http://{plug_ip}/relay/0?turn=on", timeout=5)
-        if r.ok:
-            print(f"  Plug ON (Shelly Gen1 REST)")
-            return
-    except requests.RequestException:
-        pass
-    # Tasmota
-    try:
-        r = requests.get(f"http://{plug_ip}/cm?cmnd=Power%20On", timeout=5)
-        if r.ok:
-            print(f"  Plug ON (Tasmota)")
-            return
-    except requests.RequestException:
-        pass
-    raise RuntimeError(f"Could not reach smart plug at {plug_ip}")
 
 
 def main():
@@ -196,9 +141,9 @@ def main():
 
         print(f"Hard reboot: cutting power to plug {plug_ip}...")
         try:
-            plug_off(plug_ip)
+            smart_plug.set_plug(plug_ip, on=False)
             time.sleep(30)
-            plug_on(plug_ip)
+            smart_plug.set_plug(plug_ip, on=True)
         except Exception as e:
             print(f"ERROR: Smart plug control failed — {e}", file=sys.stderr)
             sys.exit(1)
