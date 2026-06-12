@@ -12,7 +12,6 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
 
 import requests
 from xml.etree import ElementTree
@@ -83,21 +82,6 @@ class MonitorState:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def get_password() -> str:
-    password = os.environ.get("SFR_PASSWORD")
-    if password:
-        return password
-    config_path = Path("config.local.json")
-    if config_path.exists():
-        with open(config_path) as f:
-            config = json.load(f)
-        password = config.get("password")
-        if password:
-            return password
-    print("ERROR: No password found. Set SFR_PASSWORD env var or create config.local.json", file=sys.stderr)
-    sys.exit(1)
-
 
 def write_jsonl(entry: dict) -> None:
     log_dir = Path("logs")
@@ -506,7 +490,7 @@ def main() -> None:
     parser.add_argument("--username", default="admin", help="Username for auth (default: admin)")
     args = parser.parse_args()
 
-    password = get_password()
+    password = sfr_box.get_password()
     config = MonitorConfig(hostname=args.hostname, username=args.username, password=password)
 
     token, authenticated = sfr_box.authenticate(config.base_url, config.username, config.password)

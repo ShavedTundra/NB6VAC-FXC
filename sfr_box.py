@@ -1,8 +1,11 @@
-"""Shared SFR Box communication — XML parsing, auth, and endpoint polling."""
+"""Shared SFR Box communication — XML parsing, auth, endpoint polling, and credential resolution."""
 
+import json
+import sys
 from collections import defaultdict
 from hashlib import sha256
 from hmac import new as hmac_new
+from pathlib import Path
 from xml.etree import ElementTree
 
 import requests
@@ -33,6 +36,35 @@ def etree_to_dict(t: ElementTree.Element) -> dict:
 def parse_xml(content: bytes) -> dict:
     """Parse XML bytes into a nested dict."""
     return etree_to_dict(ElementTree.fromstring(content))
+
+
+def get_password() -> str:
+    """Resolve password from SFR_PASSWORD env var or config.local.json fallback.
+
+    Exits with error message if no password is found.
+    """
+    password = _password_from_env()
+    if password:
+        return password
+    password = _password_from_config()
+    if password:
+        return password
+    print("ERROR: No password found. Set SFR_PASSWORD env var or create config.local.json", file=sys.stderr)
+    sys.exit(1)
+
+
+def _password_from_env() -> str | None:
+    import os
+    return os.environ.get("SFR_PASSWORD")
+
+
+def _password_from_config() -> str | None:
+    config_path = Path("config.local.json")
+    if config_path.exists():
+        with open(config_path) as f:
+            config = json.load(f)
+        return config.get("password")
+    return None
 
 
 def compute_auth_hash(token: str, username: str, password: str) -> str:

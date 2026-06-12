@@ -8,12 +8,10 @@ Usage:
 """
 
 import argparse
-import json
 import os
 import subprocess
 import sys
 import time
-from pathlib import Path
 
 import requests
 
@@ -21,21 +19,6 @@ import sfr_box
 import smart_plug
 
 UPTIME_THRESHOLD_H = 18  # max hours before scheduled reboot triggers
-
-
-def get_password() -> str:
-    password = os.environ.get("SFR_PASSWORD")
-    if password:
-        return password
-    config_path = Path("config.local.json")
-    if config_path.exists():
-        with open(config_path) as f:
-            config = json.load(f)
-        password = config.get("password")
-        if password:
-            return password
-    print("ERROR: No password found. Set SFR_PASSWORD env var or create config.local.json", file=sys.stderr)
-    sys.exit(1)
 
 
 def get_uptime_hours(base_url: str, token: str) -> float | None:
@@ -108,7 +91,7 @@ def main():
     parser.add_argument("--smart-plug-ip", default=None, help="Tasmota/Shelly smart plug IP (or set SMART_PLUG_IP env)")
     args = parser.parse_args()
 
-    password = args.password or get_password()
+    password = args.password or sfr_box.get_password()
     base_url = f"http://{args.hostname}/api/1.0/"
 
     # Auth first — we need a token to check uptime
