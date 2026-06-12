@@ -41,10 +41,10 @@ def get_uptime_hours(base_url: str, token: str) -> float | None:
     """Get current uptime in hours from system.getInfo."""
     data = sfr_box.poll_endpoint(base_url, "system.getInfo", token)
     rsp = data.get("rsp", {})
-    status = rsp.get("status", {})
-    if not isinstance(status, dict):
+    system = rsp.get("system", {})
+    if not isinstance(system, dict):
         return None
-    uptime_s = status.get("uptime")
+    uptime_s = system.get("@uptime")
     if uptime_s is None:
         return None
     try:
@@ -181,7 +181,7 @@ def main():
     if uptime_h is not None:
         print(f"Current uptime: {uptime_h:.1f}h")
     else:
-        print("Could not read uptime (known extract_uptime bug — proceeding anyway).")
+        print("Could not read uptime — proceeding anyway.")
 
     if args.scheduled:
         if uptime_h is not None and uptime_h < UPTIME_THRESHOLD_H:
