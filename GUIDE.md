@@ -347,14 +347,32 @@ No configuration needed — just provide the plug's IP address and the script au
 
 ### Scheduled Reboot (Cron)
 
-Combine with cron for automatic preventive reboots:
+Edit your crontab with `crontab -e` and add one of the following.
+
+#### Daily soft reboot — 3 AM via API
 
 ```bash
-# Reboot every 3 days at 04:00 if uptime > 18 hours
+0 3 * * * cd /Users/paullebras2/Documents/projects_ideas/sfr_box_nb6/NB6VAC-FXC && python reboot.py >> logs/reboot.log 2>&1
+```
+
+#### Daily hard reboot — 3 AM via smart plug
+
+Replace `192.168.1.50` with your smart plug IP:
+
+```bash
+0 3 * * * cd /Users/paullebras2/Documents/projects_ideas/sfr_box_nb6/NB6VAC-FXC && python reboot.py --hard --smart-plug-ip 192.168.1.50 >> logs/reboot.log 2>&1
+```
+
+> **Tip:** Add `--scheduled` to either command to skip the reboot when uptime is already below 18 hours (e.g. the box crashed recently on its own). Without `--scheduled`, the reboot runs unconditionally every day.
+
+#### Other schedules
+
+```bash
+# Soft reboot every 3 days at 04:00 (only if uptime > 18h)
 0 4 */3 * * cd /path/to/NB6VAC-FXC && python reboot.py --scheduled >> logs/reboot.log 2>&1
 
-# Hard power cycle weekly at 03:00 if uptime > 18 hours
-0 3 * * 0 cd /path/to/NB6VAC-FXC && python reboot.py --hard --scheduled --smart-plug-ip 192.168.1.50 >> logs/reboot.log 2>&1
+# Hard power cycle weekly on Sunday at 03:00
+0 3 * * 0 cd /path/to/NB6VAC-FXC && python reboot.py --hard >> logs/reboot.log 2>&1
 ```
 
 ---
@@ -529,4 +547,6 @@ Conclusions:
 | Soft reboot | `python reboot.py` |
 | Hard reboot (smart plug) | `python reboot.py --hard --smart-plug-ip 192.168.1.50` |
 | Scheduled reboot (uptime > 18h) | `python reboot.py --scheduled` |
+| Cron: daily soft reboot at 3 AM | `0 3 * * * cd .../NB6VAC-FXC && python reboot.py >> logs/reboot.log 2>&1` |
+| Cron: daily hard reboot at 3 AM | `0 3 * * * cd .../NB6VAC-FXC && python reboot.py --hard --smart-plug-ip 192.168.1.50 >> logs/reboot.log 2>&1` |
 | Launch API client | `cd api-client && python client.py` |
