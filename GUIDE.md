@@ -345,6 +345,35 @@ The hard reboot mode uses `smart_plug.py`, which automatically detects the plug 
 
 No configuration needed — just provide the plug's IP address and the script auto-detects which protocol works.
 
+#### On-Device Local Schedule (Outage-Resistant Reboot)
+
+The `reboot.py --hard` path and the cron jobs below all share one weakness: their control channel runs through the SFR Box's own WiFi. If the box hard-freezes, the smart plug is unreachable, the Mac can't reach it, and the Shelly Cloud endpoint can't reach it either — every path dies together.
+
+A **local schedule stored on the plug itself** is the only mechanism that survives a total outage. The plug is mains-powered and the box plugs *into* it, so the plug's controller keeps running and its schedule fires on its own — independent of WiFi, the cloud, your Mac, and the box. This is Shelly's own documented pattern for router restarts.
+
+Configure it on the **plug's embedded web UI** (`http://<plug_ip>` in a browser on the same network) — **not** the phone app. The web-UI schedule is stored on the device and executes locally; the app-based schedule is cloud-triggered and dies with the network.
+
+**Schedules → Create Schedule**, then set:
+
+| Field | Value | Notes |
+|---|---|---|
+| Days | all 7 | daily |
+| Time | e.g. 03:00 | your choice |
+| Local action | **Control Output** | not Toggle Output |
+| Output State | **Off** | **must be Off** — see below |
+| Flip value after | **30** seconds, checkbox ✅ | auto-restores power after 30 s |
+
+> **Critical: Output State must be Off, not On.** `Control Output = Off` + `Flip after 30 s` cuts power now (box reboots) then restores it after 30 s — correct. The reverse (`On` + `Flip`) is a no-op now that flips to Off after 30 s, leaving the box **dead**. `Toggle Output` is non-deterministic because it depends on the plug's unknown current state. Use **Control Output → Off → Flip after 30 s**, always.
+
+**What this schedule does and does not cover:**
+
+- ✅ **Preventive** daily reboot — guaranteed as long as the box is up enough to keep the plug's NTP time-sync current (crashes self-recover in 1–3 min, so this holds).
+- ❌ **Reactive** crash recovery — if the box hard-freezes and never comes back, the plug's clock (no persistent RTC; synced via NTP over the box's WiFi) eventually drifts and the schedule becomes unreliable.
+
+The reactive case is what the **independent uplink** / Shelly Cloud endpoint fills: move the plug to a secondary SSID that does not depend on the SFR Box (4G hotspot, phone hotspot) so the cloud can reach it when the box is down. This makes the cloud endpoint genuinely useful during an outage rather than dying with the box.
+
+See [Shelly KB — Automating Home Router Restarts](https://kb.shelly.cloud/knowledge-base/kbsa-automating-home-router-restarts-using-shelly-) for the official walkthrough.
+
 ### Scheduled Reboot (Cron)
 
 Edit your crontab with `crontab -e` and add one of the following.
