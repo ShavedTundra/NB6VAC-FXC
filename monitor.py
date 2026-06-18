@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 
 import requests
 from xml.etree import ElementTree
