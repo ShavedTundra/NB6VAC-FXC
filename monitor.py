@@ -242,7 +242,10 @@ def tick_normal(
 
     status = f"PARTIAL ({failures} failures)" if failures > 0 else "OK"
     flag = " [AUTH REFRESHED]" if auth_refreshed else ""
-    print(f"[{now_utc.strftime('%H:%M:%S')}] Poll #{new_count} — {status}{flag}")
+    sys_rsp = results.get("system.getInfo", {}).get("rsp", {}).get("system", {})
+    temp = f"{int(sys_rsp['@temperature'])/1000:.1f}°C" if sys_rsp.get("@temperature") else "n/a"
+    volt = f"{float(sys_rsp['@alimvoltage'])/1000:.2f}V" if sys_rsp.get("@alimvoltage") else "n/a"
+    print(f"[{now_utc.strftime('%H:%M:%S')}] Poll #{new_count} — {status} temp={temp} volt={volt}{flag}")
 
     entry = {
         "timestamp": now_utc.isoformat(), "poll_count": new_count,
