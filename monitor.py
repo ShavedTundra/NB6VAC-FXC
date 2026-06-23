@@ -232,8 +232,16 @@ def tick_normal(
         }
         return new_state, entry
 
-    # Partial or full success
-    current_uptime = sfr_box.extract_uptime(results["system.getInfo"])
+    # Partial or full success. During a box flap system.getInfo can be a
+    # partial failure ({"error": ...}) while other endpoints succeeded; calling
+    # extract_uptime on that raises KeyError and kills the monitor (the cause of
+    # the Jun 19 death). extract_uptime itself stays strict per ADR-0001 — the
+    # caller tolerates the missing value, same pattern as tick_unreachable.
+    sys_result = results.get("system.getInfo", {})
+    if sys_result.get("rsp", {}).get("@stat") == "ok":
+        current_uptime = sfr_box.extract_uptime(sys_result)
+    else:
+        current_uptime = None
     crash_detected = (
         state.previous_uptime is not None
         and current_uptime is not None
