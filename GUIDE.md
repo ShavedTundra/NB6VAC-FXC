@@ -381,7 +381,7 @@ Edit your crontab with `crontab -e` and add one of the following.
 #### Daily soft reboot — 3 AM via API
 
 ```bash
-0 3 * * * cd /Users/paullebras2/Documents/projects_ideas/sfr_box_nb6/NB6VAC-FXC && python reboot.py >> logs/reboot.log 2>&1
+0 3 * * * cd /Users/paullebras2/projects_ideas/NB6VAC-FXC && python reboot.py >> logs/reboot.log 2>&1
 ```
 
 #### Daily hard reboot — 3 AM via smart plug
@@ -389,7 +389,7 @@ Edit your crontab with `crontab -e` and add one of the following.
 Replace `192.168.1.50` with your smart plug IP:
 
 ```bash
-0 3 * * * cd /Users/paullebras2/Documents/projects_ideas/sfr_box_nb6/NB6VAC-FXC && python reboot.py --hard --smart-plug-ip 192.168.1.50 >> logs/reboot.log 2>&1
+0 3 * * * cd /Users/paullebras2/projects_ideas/NB6VAC-FXC && python reboot.py --hard --smart-plug-ip 192.168.1.50 >> logs/reboot.log 2>&1
 ```
 
 > **Tip:** Add `--scheduled` to either command to skip the reboot when uptime is already below 18 hours (e.g. the box crashed recently on its own). Without `--scheduled`, the reboot runs unconditionally every day.
