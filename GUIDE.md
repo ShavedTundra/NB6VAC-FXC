@@ -149,9 +149,13 @@ The project includes a launchd plist template for running the monitor as a macOS
 
 > **Requirement**: Daemon mode uses `config.local.json` for the password (see §2, Method B). There is no `SFR_PASSWORD` environment variable in the plist — launchd does not inject shell env vars.
 
-#### Install
+> ⚠️ **The project directory MUST NOT live under `~/Documents`, `~/Desktop`, or `~/Downloads`.** On macOS 26 (Tahoe) and later, TCC (`kTCCServiceSystemPolicyDocumentsFolder`) blocks launchd from spawning a process whose `WorkingDirectory` / log paths are under those protected folders — the daemon dies with exit code `78` (`EX_CONFIG`) within ~16 ms and never writes a single log line, then enters a 10-second respawn throttle that `kickstart` cannot clear. Keep the repo in a top-level home folder such as `~/projects_ideas/`. Symptom in `log show`: `Service could not initialize: posix_spawn(...) error 0x1 - Operation not permitted`.
 
-1. Generate the personalized plist from the template (replace paths as needed):
+The commands below use the modern `bootstrap` / `bootout` interface. The legacy `launchctl load` / `unload` are deprecated and fail with `5: Input/output error` once a job is already registered — do not use them.
+
+#### Start from scratch (first install, or after a full stop)
+
+1. Generate the personalized plist from the template (run from the project directory):
 
 ```bash
 sed -e "s|__PROJECT_DIR__|$(pwd)|g" \
@@ -162,25 +166,45 @@ sed -e "s|__PROJECT_DIR__|$(pwd)|g" \
 
 2. Make sure `config.local.json` exists in the project directory and `logs/` is writable.
 
-3. Load the service:
+3. Register and start the service:
 
 ```bash
-launchctl load ~/Library/LaunchAgents/com.shavedtundra.sfr-monitor.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.shavedtundra.sfr-monitor.plist
 ```
 
-#### Uninstall
+#### Stop the daemon
 
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.shavedtundra.sfr-monitor.plist
+launchctl bootout gui/$(id -u)/com.shavedtundra.sfr-monitor
+```
+
+This stops the process **and** unregisters it — the service will not restart until you `bootstrap` it again. `bootout` sends `SIGTERM`; the monitor handles it cleanly (writes a `shutdown` entry to JSONL before exiting).
+
+#### Restart the daemon
+
+**Normal restart** (e.g. after editing `monitor.py`) — kills and respawns immediately, keeping the job registered:
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.shavedtundra.sfr-monitor
+```
+
+**Thorough restart** (clears the run counters / throttle state after a crash-loop). Use this if `kickstart` has no effect:
+
+```bash
+launchctl bootout   gui/$(id -u)/com.shavedtundra.sfr-monitor
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.shavedtundra.sfr-monitor.plist
 ```
 
 #### Check status
 
 ```bash
 launchctl list | grep sfr-monitor
+# 2nd field = PID if running, else the last exit code.
+
+launchctl print gui/$(id -u)/com.shavedtundra.sfr-monitor | grep -E "state|runs|pid|last exit"
 ```
 
-The second field is the PID if running, or the last exit code if stopped.
+Healthy = `state = running`, `runs` low, a PID assigned, `last exit code = (never exited)`. A high `runs` count with a non-zero exit code means the daemon is crash-looping — check `logs/monitor_stderr.log` (an empty/small stderr with exit `78` points to the TCC/`~/Documents` block above, not a code bug).
 
 #### Tail logs
 
