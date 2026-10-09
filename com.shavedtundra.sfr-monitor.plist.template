@@ -4,7 +4,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.shavedtundra.sfr-monitor</string>
+    <string>com.shavedtundra.sfr-monitor2</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -17,6 +17,12 @@
 
     <key>RunAtLoad</key>
     <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SMART_PLUG_IP</key>
+        <string>192.168.1.29</string>
+    </dict>
 
     <key>KeepAlive</key>
     <true/>

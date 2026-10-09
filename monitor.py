@@ -18,6 +18,7 @@ import requests
 from xml.etree import ElementTree
 
 import sfr_box
+import smart_plug
 
 ALL_ENDPOINTS = [
     "system.getInfo", "wan.getInfo",
@@ -58,6 +59,9 @@ class MonitorConfig:
         {"interval": 60, "duration": 600},
         {"interval": 300, "duration": None},
     ])
+    smart_plug_ip: str | None = None
+    hard_reboot_after_s: int = 180
+    hard_reboot_cooldown_s: int = 900
 
     @property
     def base_url(self) -> str:
@@ -78,6 +82,8 @@ class MonitorState:
     unreachable_phase: int = 0
     unreachable_phase_start: float = 0.0
     unreachable_error: str = ""
+    unreachable_since: float = 0.0
+    hard_reboot_attempted: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +110,65 @@ def notify_macos(title: str, message: str) -> None:
         )
     except Exception:
         pass
+
+
+# Timestamp (monotonic) of the last reactive hard reboot — module-level so it
+# survives MonitorState rebuilds across incidents (cross-incident cooldown).
+_last_hard_reboot_mono: float | None = None
+
+
+def perform_hard_reboot(plug_ip: str) -> str:
+    """Power-cycle the box via the smart plug: off, 30s, on.
+
+    Returns the plug brand that responded. Raises on plug failure (caught by
+    the caller) — never called unless the box is already hung.
+    """
+    smart_plug.set_plug(plug_ip, on=False)
+    time.sleep(30)
+    return smart_plug.set_plug(plug_ip, on=True)
+
+
+def maybe_hard_reboot(
+    state: "MonitorState", config: MonitorConfig, now_mono: float, entry: dict,
+) -> "MonitorState":
+    """Reactive watchdog: power-cycle the box when its hang has outlasted the
+    threshold (the box's own watchdog rarely fires — Oct 2026: ~10 of 14
+    failures needed a human). Fires at most once per unreachable incident,
+    with a cross-incident cooldown. Never raises: plug failure is logged into
+    the entry and retried on the next tick; the monitor must survive (ADR-0001).
+    """
+    global _last_hard_reboot_mono
+    if not config.smart_plug_ip:
+        return state
+    if state.hard_reboot_attempted:
+        return state
+    hang_s = now_mono - state.unreachable_since
+    if hang_s < config.hard_reboot_after_s:
+        return state
+    if (
+        _last_hard_reboot_mono is not None
+        and now_mono - _last_hard_reboot_mono < config.hard_reboot_cooldown_s
+    ):
+        return state
+
+    info: dict = {"hang_s": round(hang_s), "plug_ip": config.smart_plug_ip}
+    print(f"\n{'='*60}")
+    print(f"  *** HARD REBOOT TRIGGERED ***  hang={round(hang_s)}s")
+    print(f"  Power-cycling box via plug {config.smart_plug_ip}")
+    print(f"{'='*60}\n")
+    try:
+        info["plug"] = perform_hard_reboot(config.smart_plug_ip)
+        info["status"] = "ok"
+        _last_hard_reboot_mono = now_mono
+        notify_macos("SFR Box", f"Hard reboot triggered after {round(hang_s)}s hang")
+        entry["hard_reboot"] = info
+        return replace(state, hard_reboot_attempted=True)
+    except Exception as e:
+        info["status"] = "failed"
+        info["error"] = str(e)
+        entry["hard_reboot"] = info
+        print(f"[HARD REBOOT] Smart plug control failed — {e} (will retry next tick)")
+        return state
 
 
 
@@ -225,6 +290,7 @@ def tick_normal(
             last_auth_time=last_auth, previous_uptime=state.previous_uptime,
             unreachable_phase=0, unreachable_phase_start=now_mono,
             unreachable_error=last_error,
+            unreachable_since=now_mono,
         )
         entry = {
             "timestamp": now_utc.isoformat(), "poll_count": new_count,
@@ -410,24 +476,32 @@ def tick_unreachable(
                 )
             return new_state, entry
     except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, ElementTree.ParseError) as e:
-        return MonitorState(
+        new_state = MonitorState(
             mode=Mode.UNREACHABLE, poll_count=new_count, token=state.token,
             last_auth_time=state.last_auth_time,
             previous_uptime=state.previous_uptime,
             unreachable_phase=phase_idx,
             unreachable_phase_start=now_mono if phase_idx != state.unreachable_phase else state.unreachable_phase_start,
             unreachable_error=str(e),
-        ), entry
+            unreachable_since=state.unreachable_since,
+            hard_reboot_attempted=state.hard_reboot_attempted,
+        )
+        new_state = maybe_hard_reboot(new_state, config, now_mono, entry)
+        return new_state, entry
 
     # Still unreachable — advance phase in state if changed
-    return MonitorState(
+    new_state = MonitorState(
         mode=Mode.UNREACHABLE, poll_count=new_count, token=state.token,
         last_auth_time=state.last_auth_time,
         previous_uptime=state.previous_uptime,
         unreachable_phase=phase_idx,
         unreachable_phase_start=now_mono if phase_idx != state.unreachable_phase else state.unreachable_phase_start,
         unreachable_error=state.unreachable_error,
-    ), entry
+        unreachable_since=state.unreachable_since,
+        hard_reboot_attempted=state.hard_reboot_attempted,
+    )
+    new_state = maybe_hard_reboot(new_state, config, now_mono, entry)
+    return new_state, entry
 
 
 # ---------------------------------------------------------------------------
@@ -500,10 +574,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="SFR Box continuous monitor")
     parser.add_argument("--hostname", default="192.168.1.1", help="Box hostname or IP (default: 192.168.1.1)")
     parser.add_argument("--username", default="admin", help="Username for auth (default: admin)")
+    parser.add_argument("--smart-plug-ip", default=None, help="Smart plug IP for reactive hard reboot (or set SMART_PLUG_IP env)")
     args = parser.parse_args()
 
     password = sfr_box.get_password()
-    config = MonitorConfig(hostname=args.hostname, username=args.username, password=password)
+    config = MonitorConfig(
+        hostname=args.hostname, username=args.username, password=password,
+        smart_plug_ip=args.smart_plug_ip or os.environ.get("SMART_PLUG_IP"),
+    )
+    if config.smart_plug_ip:
+        print(f"[WATCHDOG] Reactive hard reboot ARMED — trigger at {config.hard_reboot_after_s}s hang, "
+              f"plug {config.smart_plug_ip}, cooldown {config.hard_reboot_cooldown_s}s")
+    else:
+        print("[WATCHDOG] Reactive hard reboot DISABLED — no smart plug IP (--smart-plug-ip / SMART_PLUG_IP)")
 
     token, authenticated = sfr_box.authenticate(config.base_url, config.username, config.password)
     if not authenticated:

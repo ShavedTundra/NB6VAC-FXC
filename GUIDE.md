@@ -329,13 +329,13 @@ A CLI tool to reboot the SFR Box via the API (soft reboot) or a smart plug (hard
 python reboot.py --hostname 192.168.1.1
 
 # Hard reboot (via smart plug — requires SMART_PLUG_IP)
-SMART_PLUG_IP=192.168.1.50 python reboot.py --hard
+SMART_PLUG_IP=192.168.1.29 python reboot.py --hard
 
 # Scheduled: only reboot if uptime > 18 hours
 python reboot.py --scheduled
 
 # Hard scheduled: power cycle only if uptime > 18 hours
-python reboot.py --hard --scheduled --smart-plug-ip 192.168.1.50
+python reboot.py --hard --scheduled --smart-plug-ip 192.168.1.29
 ```
 
 ### CLI Options
@@ -392,11 +392,38 @@ Configure it on the **plug's embedded web UI** (`http://<plug_ip>` in a browser 
 **What this schedule does and does not cover:**
 
 - ✅ **Preventive** daily reboot — guaranteed as long as the box is up enough to keep the plug's NTP time-sync current (crashes self-recover in 1–3 min, so this holds).
-- ❌ **Reactive** crash recovery — if the box hard-freezes and never comes back, the plug's clock (no persistent RTC; synced via NTP over the box's WiFi) eventually drifts and the schedule becomes unreliable.
+- ✅ **Reactive** crash recovery — now covered by the monitor's built-in watchdog (see [Reactive Hard Reboot (Watchdog)](#reactive-hard-reboot-watchdog)): October 2026 log analysis (124 daily logs) showed the box's WiFi/LAN stays up while the system hangs, so the plug remains reachable on the local network and the monitor can power-cycle it.
 
-The reactive case is what the **independent uplink** / Shelly Cloud endpoint fills: move the plug to a secondary SSID that does not depend on the SFR Box (4G hotspot, phone hotspot) so the cloud can reach it when the box is down. This makes the cloud endpoint genuinely useful during an outage rather than dying with the box.
+The watchdog covers hangs where the box's radio keeps working. The **residual** gap is a total WiFi death (radio down with the system): then every local path dies together and the **independent uplink** / Shelly Cloud endpoint is the fallback — move the plug to a secondary SSID that does not depend on the SFR Box (4G hotspot, phone hotspot) so the cloud can reach it when the box is down. No such total-radio-death hang has been observed in the logs to date.
 
 See [Shelly KB — Automating Home Router Restarts](https://kb.shelly.cloud/knowledge-base/kbsa-automating-home-router-restarts-using-shelly-) for the official walkthrough.
+
+### Reactive Hard Reboot (Watchdog)
+
+Since October 2026, `monitor.py` includes a reactive watchdog: when the box stays unreachable past a threshold, the monitor power-cycles it through the smart plug — no human needed.
+
+Why this works (it previously looked impossible): the October 9 2026 diagnosis of 124 daily logs showed that during every observed hang the box's WiFi/LAN **stays up** — the monitor kept its 10-second polls flowing through the hangs — so a plug on the same LAN is still reachable and can cut power while the box is frozen. The old "every path dies together" assumption only holds for a total radio death, never observed.
+
+Requirements (one-time, on the plug):
+
+- Plug at a **fixed IP** (static: `192.168.1.29`, mask `255.255.255.0`, gw `192.168.1.1`) — set via `Wifi.SetConfig` RPC or the plug web UI.
+- Plug **authentication disabled** (local RPC answers without login). Home-LAN trust decision, made 2026-10-09.
+
+Configuration:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `--smart-plug-ip` arg or `SMART_PLUG_IP` env | *(unset → watchdog disabled)* | Plug IP; setting it arms the watchdog |
+| Hang threshold | 180 s | Trigger only if the box has been unreachable this long. The nightly 3 AM reboot takes 80–150 s of unreachable time — safely below. |
+| Cooldown | 900 s | Minimum spacing between two power-cycles, even across separate incidents (crash-loop protection). |
+
+Behavior:
+
+- Fires **once per unreachable incident**; a plug failure is logged (`hard_reboot.status: "failed"`) and retried on the next tick — the monitor never dies from plug errors (ADR-0001).
+- Every trigger lands in the daily JSONL: `hard_reboot: {hang_s, plug_ip, plug, status}`.
+- macOS notification fires on each trigger.
+
+The launchd daemon ships `SMART_PLUG_IP=192.168.1.29` via `EnvironmentVariables` in the plist (see `com.shavedtundra.sfr-monitor.plist.template`).
 
 ### Scheduled Reboot (Cron)
 
@@ -410,10 +437,10 @@ Edit your crontab with `crontab -e` and add one of the following.
 
 #### Daily hard reboot — 3 AM via smart plug
 
-Replace `192.168.1.50` with your smart plug IP:
+Replace `192.168.1.29` with your smart plug IP:
 
 ```bash
-0 3 * * * cd /Users/paullebras2/projects_ideas/NB6VAC-FXC && python reboot.py --hard --smart-plug-ip 192.168.1.50 >> logs/reboot.log 2>&1
+0 3 * * * cd /Users/paullebras2/projects_ideas/NB6VAC-FXC && python reboot.py --hard --smart-plug-ip 192.168.1.29 >> logs/reboot.log 2>&1
 ```
 
 > **Tip:** Add `--scheduled` to either command to skip the reboot when uptime is already below 18 hours (e.g. the box crashed recently on its own). Without `--scheduled`, the reboot runs unconditionally every day.
@@ -598,8 +625,8 @@ Conclusions:
 | Find crash context | `grep '"crash_context"' logs/*.jsonl` |
 | Find outages | `grep '"box_unreachable": true' logs/*.jsonl` |
 | Soft reboot | `python reboot.py` |
-| Hard reboot (smart plug) | `python reboot.py --hard --smart-plug-ip 192.168.1.50` |
+| Hard reboot (smart plug) | `python reboot.py --hard --smart-plug-ip 192.168.1.29` |
 | Scheduled reboot (uptime > 18h) | `python reboot.py --scheduled` |
 | Cron: daily soft reboot at 3 AM | `0 3 * * * cd .../NB6VAC-FXC && python reboot.py >> logs/reboot.log 2>&1` |
-| Cron: daily hard reboot at 3 AM | `0 3 * * * cd .../NB6VAC-FXC && python reboot.py --hard --smart-plug-ip 192.168.1.50 >> logs/reboot.log 2>&1` |
+| Cron: daily hard reboot at 3 AM | `0 3 * * * cd .../NB6VAC-FXC && python reboot.py --hard --smart-plug-ip 192.168.1.29 >> logs/reboot.log 2>&1` |
 | Launch API client | `cd api-client && python client.py` |
