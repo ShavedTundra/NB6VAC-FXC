@@ -137,3 +137,5 @@ logs/
 
 # Sandcastle sandbox artifacts
 .sandcastle/
+
+node_modules/

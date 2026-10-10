@@ -1,0 +1,18 @@
+{
+  "name": "nb6vac-fxc",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "SFR Box NB6VAC-FXC tooling: monitor daemon, watchdog, and sandboxed sandcastle agent orchestration",
+  "scripts": {
+    "sandcastle": "tsx .sandcastle/main.mts",
+    "smoke": "node --input-type=module -e \"import('@ai-hero/sandcastle').then(m => console.log('engine ok:', typeof m.run === 'function', typeof m.pi === 'function')).catch(e => { console.error('engine import FAILED', e.message); process.exit(1); })\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@ai-hero/sandcastle": "0.12.0",
+    "tsx": "^4.21.0",
+    "typescript": "~5.9.3",
+    "zod": "4.6.5"
+  }
+}
